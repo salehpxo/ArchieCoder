@@ -146,6 +146,98 @@ function globToRegex(pattern: string): RegExp {
   return new RegExp("^" + regexStr + "$");
 }
 
+const IGNORED_DIR_NAMES = new Set([
+  ".cache",
+  ".git",
+  ".next",
+  ".nuxt",
+  ".parcel-cache",
+  ".svelte-kit",
+  ".turbo",
+  ".venv",
+  "build",
+  "coverage",
+  "dist",
+  "env",
+  "node_modules",
+  "out",
+  "target",
+  "tmp",
+  "vendor",
+  "venv",
+  "__pycache__",
+]);
+
+const IGNORED_FILE_NAMES = new Set([
+  ".DS_Store",
+  "bun.lockb",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+]);
+
+const IGNORED_FILE_EXTENSIONS = new Set([
+  ".7z",
+  ".avif",
+  ".bin",
+  ".bmp",
+  ".class",
+  ".dll",
+  ".dmg",
+  ".exe",
+  ".gif",
+  ".gz",
+  ".ico",
+  ".jar",
+  ".jpeg",
+  ".jpg",
+  ".lock",
+  ".log",
+  ".map",
+  ".min.css",
+  ".min.js",
+  ".o",
+  ".pdf",
+  ".png",
+  ".pyc",
+  ".so",
+  ".svg",
+  ".tar",
+  ".tsbuildinfo",
+  ".webp",
+  ".zip",
+]);
+
+const MAX_READ_BYTES = 1024 * 1024;
+
+function normalizeToolPath(filePath: string): string {
+  return path
+    .relative(CWD, path.resolve(filePath))
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "");
+}
+
+function ignoredPathReason(filePath: string): string | undefined {
+  const normalized = normalizeToolPath(filePath);
+  const parts = normalized.split("/").filter(Boolean);
+  const ignoredDir = parts.find((part) => IGNORED_DIR_NAMES.has(part));
+  if (ignoredDir) return `ignored directory: ${ignoredDir}`;
+
+  const fileName = parts.at(-1) ?? normalized;
+  if (IGNORED_FILE_NAMES.has(fileName)) return `ignored file: ${fileName}`;
+  if (fileName === ".env" || fileName.startsWith(".env.")) {
+    return "ignored secret file";
+  }
+
+  const lowerFileName = fileName.toLowerCase();
+  const ignoredExtension = Array.from(IGNORED_FILE_EXTENSIONS).find((ext) =>
+    lowerFileName.endsWith(ext)
+  );
+  if (ignoredExtension) return `ignored file type: ${ignoredExtension}`;
+
+  return undefined;
+}
+
 async function walkDir(dir: string): Promise<string[]> {
   const entries: string[] = [];
   const stack = [dir];
@@ -159,6 +251,7 @@ async function walkDir(dir: string): Promise<string[]> {
     }
     for (const item of items) {
       const fullPath = path.join(current, item.name);
+      if (ignoredPathReason(fullPath)) continue;
       if (item.isDirectory()) {
         stack.push(fullPath);
       } else if (item.isFile()) {
@@ -194,6 +287,14 @@ async function glob(
 // ---------------------------------------------------------------------------
 async function toolRead(args: Record<string, JsonValue>): Promise<string> {
   const filePath = args.path as string;
+  const ignoredReason = ignoredPathReason(filePath);
+  if (ignoredReason) {
+    return `error: refused to read ${filePath} (${ignoredReason})`;
+  }
+  const stats = await fs.stat(filePath);
+  if (stats.size > MAX_READ_BYTES) {
+    return `error: refused to read ${filePath} (file is larger than ${MAX_READ_BYTES} bytes)`;
+  }
   const offset = (args.offset as number) ?? 0;
   const limit = args.limit as number | undefined;
   const content = await fs.readFile(filePath, "utf-8");
@@ -245,6 +346,7 @@ async function toolGrep(args: Record<string, JsonValue>): Promise<string> {
   for (const filePath of files) {
     if (hits.length >= 50) break;
     try {
+      if (statSync(filePath).size > MAX_READ_BYTES) continue;
       const content = await fs.readFile(filePath, "utf-8");
       const lines = content.split("\n");
       for (let i = 0; i < lines.length; i++) {
