@@ -13,7 +13,7 @@
  */
 
 import * as fs from "node:fs/promises";
-import { existsSync, statSync, readFileSync } from "node:fs";
+import { existsSync, statSync, readFileSync, type Dirent } from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { emitKeypressEvents } from "node:readline";
@@ -136,7 +136,7 @@ function globToRegex(pattern: string): RegExp {
       regexStr += "[^/]*";
     } else if (ch === "?") {
       regexStr += "[^/]";
-    } else if (".+^$()[]{}|\\".includes(ch)) {
+    } else if (ch && ".+^$()[]{}|\\".includes(ch)) {
       regexStr += "\\" + ch;
     } else {
       regexStr += ch;
@@ -243,7 +243,7 @@ async function walkDir(dir: string): Promise<string[]> {
   const stack = [dir];
   while (stack.length) {
     const current = stack.pop()!;
-    let items: fs.Dirent[];
+    let items: Dirent[];
     try {
       items = await fs.readdir(current, { withFileTypes: true });
     } catch {
@@ -351,8 +351,9 @@ async function toolGrep(args: Record<string, JsonValue>): Promise<string> {
       const lines = content.split("\n");
       for (let i = 0; i < lines.length; i++) {
         if (hits.length >= 50) break;
-        if (regex.test(lines[i])) {
-          hits.push(`${filePath}:${i + 1}:${lines[i].trimEnd()}`);
+        const line = lines[i] ?? "";
+        if (regex.test(line)) {
+          hits.push(`${filePath}:${i + 1}:${line.trimEnd()}`);
         }
       }
     } catch {
@@ -723,290 +724,276 @@ async function runTool(
 // ---------------------------------------------------------------------------
 
 interface CursorPos {
-  line: number; // index into lines[]
-  col: number;  // byte offset into that line
+  line: number;
+  col: number;
+}
+
+interface ProjectFile {
+  path: string;
+  name: string;
+  directory: string;
+  mtimeMs: number;
+}
+
+interface MentionRange {
+  line: number;
+  startCol: number;
+  endCol: number;
+  query: string;
+}
+
+const FILE_PICKER_LIMIT = 10;
+const FILE_INDEX_TTL_MS = 5_000;
+let fileIndexCache: { createdAt: number; files: ProjectFile[] } | undefined;
+
+async function getProjectFiles(): Promise<ProjectFile[]> {
+  const now = Date.now();
+  if (fileIndexCache && now - fileIndexCache.createdAt < FILE_INDEX_TTL_MS) {
+    return fileIndexCache.files;
+  }
+
+  const files = (await walkDir(CWD))
+    .map((filePath) => {
+      const relativePath = normalizeToolPath(filePath);
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(filePath).mtimeMs;
+      } catch {
+        // If a file disappears while indexing, keep it low priority.
+      }
+      return {
+        path: relativePath,
+        name: path.basename(relativePath),
+        directory: path.dirname(relativePath) === "." ? "" : path.dirname(relativePath),
+        mtimeMs,
+      } satisfies ProjectFile;
+    })
+    .sort((a, b) => a.path.localeCompare(b.path));
+
+  fileIndexCache = { createdAt: now, files };
+  return files;
+}
+
+function activeMention(lines: string[], cursor: CursorPos): MentionRange | undefined {
+  const line = lines[cursor.line] ?? "";
+  const beforeCursor = line.slice(0, cursor.col);
+  const at = beforeCursor.lastIndexOf("@");
+  if (at < 0) return undefined;
+
+  const charBeforeAt = at > 0 ? beforeCursor[at - 1] : "";
+  if (charBeforeAt && !/\s|[(\[{,]/.test(charBeforeAt)) return undefined;
+
+  const query = beforeCursor.slice(at + 1);
+  if (/\s/.test(query)) return undefined;
+
+  return { line: cursor.line, startCol: at, endCol: cursor.col, query };
+}
+
+function scoreFileMention(file: ProjectFile, query: string): number {
+  if (!query) return 1000 + file.mtimeMs / 1_000_000_000;
+
+  const q = query.toLowerCase();
+  const full = file.path.toLowerCase();
+  const name = file.name.toLowerCase();
+  let score = 0;
+
+  if (name === q) score += 1000;
+  if (full === q) score += 900;
+  if (name.startsWith(q)) score += 700;
+  if (full.startsWith(q)) score += 550;
+  if (name.includes(q)) score += 350;
+  if (full.includes(q)) score += 250;
+
+  let pos = -1;
+  let fuzzy = 0;
+  for (const ch of q) {
+    pos = full.indexOf(ch, pos + 1);
+    if (pos < 0) return score;
+    fuzzy += 12;
+  }
+
+  return score + fuzzy - file.path.length / 100;
+}
+
+function findMentionSuggestions(
+  files: ProjectFile[],
+  mention: MentionRange | undefined
+): ProjectFile[] {
+  if (!mention) return [];
+
+  return files
+    .map((file) => ({ file, score: scoreFileMention(file, mention.query) }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path))
+    .slice(0, FILE_PICKER_LIMIT)
+    .map(({ file }) => file);
+}
+
+function displayPathForMention(filePath: string): string {
+  return filePath.includes(" ") ? `"${filePath.replaceAll('"', '\\"')}"` : filePath;
+}
+
+function insertMention(
+  lines: string[],
+  cursor: CursorPos,
+  mention: MentionRange,
+  selectedPath: string
+) {
+  const line = lines[mention.line] ?? "";
+  const replacement = `@${displayPathForMention(selectedPath)}`;
+  lines[mention.line] =
+    line.slice(0, mention.startCol) + replacement + line.slice(mention.endCol);
+  cursor.line = mention.line;
+  cursor.col = mention.startCol + replacement.length;
+}
+
+function visualRows(text: string, cols: number): number {
+  return Math.max(1, Math.ceil(Math.max(1, stripAnsi(text).length) / cols));
+}
+
+function selectedMentionPaths(text: string): string[] {
+  const paths = new Set<string>();
+  const mentionPattern = /(^|\s)@("(?:\\"|[^"])+"|\S+)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = mentionPattern.exec(text))) {
+    const raw = match[2];
+    if (!raw) continue;
+    const unquoted = raw.startsWith('"') && raw.endsWith('"')
+      ? raw.slice(1, -1).replaceAll('\\"', '"')
+      : raw;
+    const resolved = path.resolve(CWD, unquoted);
+    if (existsSync(resolved) && statSync(resolved).isFile() && !ignoredPathReason(resolved)) {
+      paths.add(normalizeToolPath(resolved));
+    }
+  }
+
+  return [...paths];
+}
+
+async function buildMentionContext(text: string): Promise<string> {
+  const paths = selectedMentionPaths(text);
+  if (!paths.length) return text;
+
+  const sections: string[] = [];
+  for (const filePath of paths) {
+    try {
+      const stats = await fs.stat(filePath);
+      if (stats.size > MAX_READ_BYTES) {
+        sections.push(`--- @${filePath} skipped: file is larger than ${MAX_READ_BYTES} bytes ---`);
+        continue;
+      }
+      const content = await fs.readFile(filePath, "utf-8");
+      sections.push(`--- @${filePath} ---\n${content}\n--- end @${filePath} ---`);
+    } catch (err: any) {
+      sections.push(`--- @${filePath} skipped: ${err.message ?? err} ---`);
+    }
+  }
+
+  return `${text}\n\nAttached file context from @ mentions:\n${sections.join("\n\n")}`;
 }
 
 /**
- * Read multi-line input from stdin.
- *   Enter       → submits the text
- *   Shift+Enter → inserts a new line
- *   Arrow keys, Home, End, Backspace, Ctrl+D, Ctrl+C all work as expected.
+ * Read multi-line input from stdin with project-file mentions.
+ * Type @ to open the file picker, filter by path, then press Enter/Tab to insert.
  */
-function ask(prompt: string): Promise<string> {
+async function ask(prompt: string): Promise<string> {
+  const projectFiles = await getProjectFiles();
+
   return new Promise((resolve) => {
     const lines: string[] = [""];
     const cursor: CursorPos = { line: 0, col: 0 };
     const wasRaw = input.isRaw;
+    let lastRenderRows = 1;
+    let selectedSuggestion = 0;
+    let closedMentionKey: string | undefined;
 
-    // ── helpers ──────────────────────────────────────────────────
+    const cols = () => process.stdout.columns ?? 80;
 
-    /** How many terminal rows the current content occupies. */
-    const contentRows = (): number => {
-      const promptLen = stripAnsi(prompt).length;
-      const totalChars =
-        promptLen + lines.reduce((s, l) => s + l.length, 0) + Math.max(0, lines.length - 1);
-      const cols = process.stdout.columns ?? 80;
-      // Each line may wrap – rough but sufficient for cursor cleanup
-      let rows = 0;
-      // prompt is on first row
-      rows += Math.ceil((promptLen + (lines[0]?.length ?? 0)) / cols);
-      for (let i = 1; i < lines.length; i++) {
-        rows += 1 + Math.ceil((lines[i]?.length ?? 0) / cols); // +1 for the newline we output
-      }
-      return rows;
+    const mentionState = () => {
+      const mention = activeMention(lines, cursor);
+      const key = mention ? `${mention.line}:${mention.startCol}` : undefined;
+      if (key && key === closedMentionKey) return { mention: undefined, suggestions: [] };
+      const suggestions = findMentionSuggestions(projectFiles, mention);
+      if (selectedSuggestion >= suggestions.length) selectedSuggestion = 0;
+      return { mention, suggestions };
     };
 
-    /** Move cursor back to the start of the input area. */
-    const moveHome = (rows: number) => {
-      for (let i = 0; i < rows; i++) {
-        output.write("\x1b[A"); // cursor up
-      }
-    };
+    const render = () => {
+      const width = cols();
+      const { mention, suggestions } = mentionState();
+      const screenLines = [prompt + (lines[0] ?? ""), ...lines.slice(1)];
 
-    /** Clear from cursor to end of screen, then write everything. */
-    const rerender = () => {
-      const rows = contentRows();
-      if (rows > 0) moveHome(rows);
-      output.write("\x1b[J"); // clear from cursor to end of screen
-      output.write(prompt);
-      output.write(lines.join("\n"));
-      // Place cursor at the right position
-      const line = lines[cursor.line] ?? "";
-      let targetRow = 0;
-      // Calculate which row the cursor line starts on
+      if (mention) {
+        const title = suggestions.length
+          ? `${DIM} @ files (${mention.query || "type to filter"})${RESET}`
+          : `${DIM} @ files: no matches${RESET}`;
+        screenLines.push(title);
+        suggestions.forEach((file, idx) => {
+          const marker = idx === selectedSuggestion ? `${CYAN}›${RESET}` : " ";
+          const dir = file.directory ? `${DIM} ${file.directory}${RESET}` : "";
+          screenLines.push(`${marker} ${file.name}${dir}`);
+        });
+        if (suggestions.length) {
+          screenLines.push(`${DIM} Enter/Tab select · Esc close · ↑/↓ navigate${RESET}`);
+        }
+      }
+
+      for (let i = 0; i < lastRenderRows - 1; i++) output.write("\x1b[A");
+      output.write("\r\x1b[J");
+      output.write(screenLines.join("\n"));
+
+      const visualLineRows = screenLines.map((line) => visualRows(line, width));
+      lastRenderRows = visualLineRows.reduce((sum, rowCount) => sum + rowCount, 0);
+
       const promptLen = stripAnsi(prompt).length;
-      targetRow += Math.ceil((promptLen + (lines[0] ?? "").length) / cols);
-      for (let i = 1; i <= cursor.line; i++) {
-        targetRow += 1 + Math.ceil((lines[i - 1] ?? "").length / cols);
+      let targetVisualRow = 0;
+      for (let i = 0; i < cursor.line; i++) {
+        targetVisualRow += visualRows(i === 0 ? prompt + (lines[0] ?? "") : lines[i] ?? "", width);
       }
-      // Now we're at end of content. Move up to the cursor line.
-      const totalRows = contentRows();
-      const rowsToGoUp = totalRows - 1 - cursor.line;
-      // Actually simpler: just recalculate based on current position
-      // We're at the bottom. Go up to the cursor row.
-      // console.error is not great, let's just compute.
-      // We'll use a simpler approach - just compute cursor position from lines
-    };
+      const cursorColWithPrompt = (cursor.line === 0 ? promptLen : 0) + cursor.col;
+      targetVisualRow += Math.floor(cursorColWithPrompt / width);
+      const targetCol = (cursorColWithPrompt % width) + 1;
 
-    const cols = process.stdout.columns ?? 80;
-
-    /** Move cursor to the visual position of (cursor.line, cursor.col). */
-    const positionCursor = () => {
-      // Calculate which visual row the cursor is on within its line
-      const line = lines[cursor.line] ?? "";
-      const promptLen = stripAnsi(prompt).length;
-
-      // How many rows are _before_ the cursor line
-      let rowsBefore = Math.ceil((promptLen + (lines[0] ?? "").length) / cols);
-      for (let i = 1; i < cursor.line; i++) {
-        rowsBefore += 1 + Math.ceil((lines[i] ?? "").length / cols);
-      }
-      // Row offset within the cursor line
-      const rowWithin = Math.floor(cursor.col / cols);
-      const colWithin = cursor.col % cols;
-
-      // Total rows of content
-      const totalRows =
-        Math.ceil((promptLen + (lines[0] ?? "").length) / cols) +
-        lines.slice(1).reduce((s, l) => s + 1 + Math.ceil(l.length / cols), 0);
-
-      // Rows to go up from bottom
-      const rowsUp = totalRows - (rowsBefore + rowWithin) - 1;
-
+      const currentVisualRow = lastRenderRows - 1;
+      const rowsUp = currentVisualRow - targetVisualRow;
       if (rowsUp > 0) {
         for (let i = 0; i < rowsUp; i++) output.write("\x1b[A");
       }
-      // Now go to correct column
-      output.write(`\x1b[${colWithin + 1}G`); // absolute column
-      if (rowWithin > 0) {
-        output.write(`\x1b[${rowWithin}B`);
-      }
+      output.write(`\x1b[${targetCol}G`);
     };
 
-    // ── raw mode + keypress events ───────────────────────────────
-
-    input.setRawMode(true);
-    input.resume();
-    emitKeypressEvents(input);
-
-    // Initial render
-    output.write(prompt);
-
-    const onKeypress = (str: string | undefined, key: any) => {
-      if (!key) return;
-
-      if (key.name === "return") {
-        if (key.shift) {
-          // ── Shift+Enter → new line ──
-          const line = lines[cursor.line] ?? "";
-          const before = line.slice(0, cursor.col);
-          const after = line.slice(cursor.col);
-          lines[cursor.line] = before;
-          lines.splice(cursor.line + 1, 0, after);
-          cursor.line++;
-          cursor.col = 0;
-          output.write("\n");
-        } else {
-          // ── Enter → submit ──
-          cleanup();
-          output.write("\n");
-          resolve(lines.join("\n"));
-          return;
-        }
-      } else if (key.name === "backspace") {
-        if (cursor.col > 0) {
-          const line = lines[cursor.line] ?? "";
-          lines[cursor.line] = line.slice(0, cursor.col - 1) + line.slice(cursor.col);
-          cursor.col--;
-          rewrite();
-        } else if (cursor.line > 0) {
-          // Merge with previous line
-          const prev = lines[cursor.line - 1] ?? "";
-          const cur = lines[cursor.line] ?? "";
-          cursor.col = prev.length;
-          lines[cursor.line - 1] = prev + cur;
-          lines.splice(cursor.line, 1);
-          cursor.line--;
-          rewrite();
-        }
-      } else if (key.name === "delete") {
-        const line = lines[cursor.line] ?? "";
-        if (cursor.col < line.length) {
-          lines[cursor.line] = line.slice(0, cursor.col) + line.slice(cursor.col + 1);
-          rewrite();
-        } else if (cursor.line < lines.length - 1) {
-          // Join with next line
-          const next = lines[cursor.line + 1] ?? "";
-          lines[cursor.line] = line + next;
-          lines.splice(cursor.line + 1, 1);
-          rewrite();
-        }
-      } else if (key.name === "left") {
-        if (cursor.col > 0) {
-          cursor.col--;
-          output.write("\x1b[D");
-        } else if (cursor.line > 0) {
-          cursor.line--;
-          cursor.col = (lines[cursor.line] ?? "").length;
-          output.write("\x1b[A");
-          output.write(`\x1b[${(cursor.col % cols) + 1}G`);
-        }
-      } else if (key.name === "right") {
-        const line = lines[cursor.line] ?? "";
-        if (cursor.col < line.length) {
-          cursor.col++;
-          output.write("\x1b[C");
-        } else if (cursor.line < lines.length - 1) {
-          cursor.line++;
-          cursor.col = 0;
-          output.write("\x1b[B");
-          output.write("\x1b[1G");
-        }
-      } else if (key.name === "up") {
-        if (cursor.line > 0) {
-          const prevLine = lines[cursor.line - 1] ?? "";
-          cursor.line--;
-          cursor.col = Math.min(cursor.col, prevLine.length);
-          output.write("\x1b[A");
-        }
-      } else if (key.name === "down") {
-        if (cursor.line < lines.length - 1) {
-          const nextLine = lines[cursor.line + 1] ?? "";
-          cursor.line++;
-          cursor.col = Math.min(cursor.col, nextLine.length);
-          output.write("\x1b[B");
-        }
-      } else if (key.name === "home") {
-        cursor.col = 0;
-        output.write(`\x1b[${stripAnsi(prompt).length + 1}G`);
-      } else if (key.name === "end") {
-        const line = lines[cursor.line] ?? "";
-        cursor.col = line.length;
-        rewrite();
-      } else if (key.ctrl && key.name === "c") {
-        cleanup();
-        output.write("\n");
-        process.exit(0);
-      } else if (key.ctrl && key.name === "d") {
-        cleanup();
-        output.write("\n");
-        resolve("");
-      } else if (key.ctrl && key.name === "l") {
-        // Ctrl+L – clear screen, then re-render
-        output.write("\x1b[2J\x1b[H");
-        rewrite();
-      } else if (str && str.length === 1 && !key.ctrl && !key.meta) {
-        // ── printable character ──
-        const line = lines[cursor.line] ?? "";
-        lines[cursor.line] = line.slice(0, cursor.col) + str + line.slice(cursor.col);
-        cursor.col++;
-        // Write the rest of the line + all lines after it, then reposition
-        const restOfLine = (lines[cursor.line] ?? "").slice(cursor.col - 1);
-        output.write(restOfLine);
-        // Write subsequent lines
-        for (let i = cursor.line + 1; i < lines.length; i++) {
-          output.write("\n" + (lines[i] ?? ""));
-        }
-        // Now move cursor back to where it should be
-        // We're at the end of all content. Need to go back up.
-        const remainingLines = lines.length - 1 - cursor.line;
-        for (let i = 0; i < remainingLines; i++) {
-          output.write("\x1b[A");
-        }
-        // Move cursor back within line if we wrote more than 1 char
-        const charsWritten = restOfLine.length;
-        if (charsWritten > 1) {
-          output.write(`\x1b[${charsWritten - 1}D`);
-        }
-      }
+    const closeMention = () => {
+      const mention = activeMention(lines, cursor);
+      closedMentionKey = mention ? `${mention.line}:${mention.startCol}` : undefined;
+      selectedSuggestion = 0;
     };
 
-    const rewrite = () => {
-      // Move up to prompt area, clear, rewrite, reposition
-      const totalLines = lines.length;
-      // Move up: we need to know how many terminal rows we wrote
-      const promptLen = stripAnsi(prompt).length;
-      let rows = Math.ceil((promptLen + (lines[0] ?? "").length) / cols);
-      for (let i = 1; i < lines.length; i++) {
-        rows += 1 + Math.ceil((lines[i] ?? "").length / cols);
-      }
-      if (rows > 0) {
-        for (let i = 0; i < rows; i++) output.write("\x1b[A");
-      }
-      output.write("\r\x1b[J"); // carriage return + clear to end
-      output.write(prompt);
-      output.write(lines.join("\n"));
-      // Reposition cursor
-      // Calculate visual row of cursor
-      let cursorVisualRow = Math.floor((promptLen + (lines[0] ?? "").length) / cols);
-      for (let i = 1; i <= cursor.line; i++) {
-        cursorVisualRow += 1 + Math.floor((lines[i - 1] ?? "").length / cols);
-      }
-      const rowWithinLine = Math.floor(cursor.col / cols);
-      const colWithinLine = cursor.col % cols;
-      // Total visual rows now
-      let totalVisualRows = cursorVisualRow; // last row index
-      const lastLineIdx = lines.length - 1;
-      totalVisualRows = Math.floor((promptLen + (lines[0] ?? "").length) / cols);
-      for (let i = 1; i < lines.length; i++) {
-        totalVisualRows += 1 + Math.floor((lines[i] ?? "").length / cols);
-      }
-      // We're at bottom. Go up to cursor row.
-      const currentVisualRow = totalVisualRows;
-      const targetVisualRow =
-        Math.floor((promptLen + (lines[0] ?? "").length) / cols) +
-        (cursor.line > 0 ? 1 : 0) +
-        lines.slice(1, cursor.line).reduce((s, l) => s + 1 + Math.floor(l.length / cols), 0) +
-        rowWithinLine;
-      const goUp = currentVisualRow - targetVisualRow;
-      if (goUp > 0) {
-        for (let i = 0; i < goUp; i++) output.write("\x1b[A");
-      }
-      // Now set column (absolute)
-      output.write(`\x1b[${colWithinLine + 1 + stripAnsi(prompt).length}G`);
-      // If rowWithinLine > 0, we already went up to the right row
-      // Hmm, this is getting complex. Let me use a simpler approach.
+    const acceptSuggestion = (): boolean => {
+      const { mention, suggestions } = mentionState();
+      if (!mention || !suggestions.length) return false;
+      insertMention(lines, cursor, mention, suggestions[selectedSuggestion]!.path);
+      closedMentionKey = undefined;
+      selectedSuggestion = 0;
+      return true;
+    };
+
+    const insertText = (text: string) => {
+      const line = lines[cursor.line] ?? "";
+      lines[cursor.line] = line.slice(0, cursor.col) + text + line.slice(cursor.col);
+      cursor.col += text.length;
+      closedMentionKey = undefined;
+    };
+
+    const splitLine = () => {
+      const line = lines[cursor.line] ?? "";
+      const before = line.slice(0, cursor.col);
+      const after = line.slice(cursor.col);
+      lines[cursor.line] = before;
+      lines.splice(cursor.line + 1, 0, after);
+      cursor.line++;
+      cursor.col = 0;
+      closedMentionKey = undefined;
     };
 
     const cleanup = () => {
@@ -1015,7 +1002,120 @@ function ask(prompt: string): Promise<string> {
       input.pause();
     };
 
+    const onKeypress = (str: string | undefined, key: any) => {
+      if (!key) return;
+      const { mention, suggestions } = mentionState();
+
+      if (mention && key.name === "tab") {
+        if (acceptSuggestion()) render();
+        return;
+      }
+
+      if (key.name === "return") {
+        if (mention && suggestions.length) {
+          acceptSuggestion();
+          render();
+        } else if (key.shift) {
+          splitLine();
+          render();
+        } else {
+          cleanup();
+          output.write("\n");
+          resolve(lines.join("\n"));
+        }
+        return;
+      }
+
+      if (mention && key.name === "escape") {
+        closeMention();
+        render();
+        return;
+      }
+
+      if (mention && suggestions.length && (key.name === "up" || key.name === "down")) {
+        selectedSuggestion =
+          key.name === "up"
+            ? (selectedSuggestion - 1 + suggestions.length) % suggestions.length
+            : (selectedSuggestion + 1) % suggestions.length;
+        render();
+        return;
+      }
+
+      if (key.name === "backspace") {
+        if (cursor.col > 0) {
+          const line = lines[cursor.line] ?? "";
+          lines[cursor.line] = line.slice(0, cursor.col - 1) + line.slice(cursor.col);
+          cursor.col--;
+          closedMentionKey = undefined;
+        } else if (cursor.line > 0) {
+          const prev = lines[cursor.line - 1] ?? "";
+          const cur = lines[cursor.line] ?? "";
+          cursor.col = prev.length;
+          lines[cursor.line - 1] = prev + cur;
+          lines.splice(cursor.line, 1);
+          cursor.line--;
+          closedMentionKey = undefined;
+        }
+      } else if (key.name === "delete") {
+        const line = lines[cursor.line] ?? "";
+        if (cursor.col < line.length) {
+          lines[cursor.line] = line.slice(0, cursor.col) + line.slice(cursor.col + 1);
+        } else if (cursor.line < lines.length - 1) {
+          lines[cursor.line] = line + (lines[cursor.line + 1] ?? "");
+          lines.splice(cursor.line + 1, 1);
+        }
+        closedMentionKey = undefined;
+      } else if (key.name === "left") {
+        if (cursor.col > 0) cursor.col--;
+        else if (cursor.line > 0) {
+          cursor.line--;
+          cursor.col = (lines[cursor.line] ?? "").length;
+        }
+      } else if (key.name === "right") {
+        const line = lines[cursor.line] ?? "";
+        if (cursor.col < line.length) cursor.col++;
+        else if (cursor.line < lines.length - 1) {
+          cursor.line++;
+          cursor.col = 0;
+        }
+      } else if (key.name === "up") {
+        if (cursor.line > 0) {
+          cursor.line--;
+          cursor.col = Math.min(cursor.col, (lines[cursor.line] ?? "").length);
+        }
+      } else if (key.name === "down") {
+        if (cursor.line < lines.length - 1) {
+          cursor.line++;
+          cursor.col = Math.min(cursor.col, (lines[cursor.line] ?? "").length);
+        }
+      } else if (key.name === "home") {
+        cursor.col = 0;
+      } else if (key.name === "end") {
+        cursor.col = (lines[cursor.line] ?? "").length;
+      } else if (key.ctrl && key.name === "c") {
+        cleanup();
+        output.write("\n");
+        process.exit(0);
+      } else if (key.ctrl && key.name === "d") {
+        cleanup();
+        output.write("\n");
+        resolve("");
+        return;
+      } else if (key.ctrl && key.name === "l") {
+        output.write("\x1b[2J\x1b[H");
+        lastRenderRows = 1;
+      } else if (str && !key.ctrl && !key.meta) {
+        insertText(str);
+      }
+
+      render();
+    };
+
+    input.setRawMode(true);
+    input.resume();
+    emitKeypressEvents(input);
     input.on("keypress", onKeypress);
+    render();
   });
 }
 
@@ -1048,7 +1148,7 @@ async function main() {
         continue;
       }
 
-      messages.push({ role: "user", content: trimmed });
+      messages.push({ role: "user", content: await buildMentionContext(trimmed) });
 
       let turn = true;
       while (turn) {
@@ -1071,15 +1171,15 @@ async function main() {
               Object.values(toolArgs)[0] ?? ""
             ).slice(0, 50);
             console.log(
-              `\n${GREEN}⏺ ${toolName[0].toUpperCase() + toolName.slice(1)}${RESET}(${DIM}${previewArg}${RESET})`
+              `\n${GREEN}⏺ ${(toolName[0] ?? "").toUpperCase() + toolName.slice(1)}${RESET}(${DIM}${previewArg}${RESET})`
             );
 
             const result = await runTool(toolName, toolArgs);
             const resultLines = result.split("\n");
-            let preview = resultLines[0].slice(0, 60);
+            let preview = (resultLines[0] ?? "").slice(0, 60);
             if (resultLines.length > 1)
               preview += ` ... +${resultLines.length - 1} lines`;
-            else if (resultLines[0].length > 60) preview += "...";
+            else if ((resultLines[0] ?? "").length > 60) preview += "...";
             console.log(`  ${DIM}⎿  ${preview}${RESET}`);
 
             toolResults.push({
