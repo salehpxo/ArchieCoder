@@ -70,7 +70,7 @@ function isOllamaUrl(url: string): boolean {
   try {
     const u = new URL(url);
     // Only match native /api/chat on local instances
-      console.log("🚀 ~ isOllamaUrl ~ u.hostname:", u.hostname)
+    console.log("🚀 ~ isOllamaUrl ~ u.hostname:", u.hostname)
     return (
       (u.hostname === "localhost" || u.hostname === "127.0.0.1") &&
       u.pathname === "/api/chat"
@@ -477,26 +477,36 @@ async function callOllamaChat(messages: Record<string, any>[], model: string): P
 async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> {
   const instruction = args.instruction as string;
   const fileContext = (args.file_context as string) ?? "";
-  const filePath = args.file_path as string | undefined;
+  const filePath = args.file_path as string;
+
+  if (!filePath) {
+    return "error: file_path is required";
+  }
+
+  const normalizedPath = normalizeToolPath(filePath);
+  const reason = ignoredPathReason(normalizedPath);
+  if (reason) {
+    return `error: refused to write ${normalizedPath} (${reason})`;
+  }
 
   const systemMsg = {
     role: "system",
     content:
-      "You are an expert coding assistant using Ollama. Only perform coding execution tasks such as writing code, editing code, refactoring snippets, or generating concrete implementation output. Do not do high-level planning, architecture decisions, or broad solution exploration. If file context is provided, use it to ensure accuracy. If the user wants to edit a file, provide the full corrected content or precise patch-style instructions.",
+      "You are an expert coding assistant. Only perform concrete implementation tasks: write code, edit code, refactor, or generate exact output. Do not explain, plan, or add commentary. Provide ONLY the final content, without markdown fences.",
   };
 
-  let userContent = `Task: ${instruction}\n\n`;
+  let userContent = `Task: ${instruction}\nFile: ${normalizedPath}\n`;
   if (fileContext) {
-    userContent += `Relevant File Context:\n${fileContext}\n\n`;
+    userContent += `Relevant context:\n${fileContext}\n`;
   }
-  userContent += `Please provide concrete code output for the requested implementation task only.`;
+  userContent += `Output the entire file content (no markdown fences).`;
 
   const messages = [systemMsg, { role: "user", content: userContent }];
 
   try {
     const responseMsg = await callOllamaChat(messages, OLLAMA_MODEL);
-    // Normalise the response to a string
-    let content: string = "";
+    // Extract text content (handling various response shapes)
+    let content = "";
     if (typeof responseMsg === "string") {
       content = responseMsg;
     } else if (typeof responseMsg?.content === "string") {
@@ -507,34 +517,23 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
       content = JSON.stringify(responseMsg);
     }
 
-    if (!content.trim()) {
-      content = "No response generated.";
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return "error: ollama_code returned empty content";
     }
 
-    // If a file_path was provided, clean up code fences and write the file
-    if (filePath) {
-      const normalizedPath = normalizeToolPath(filePath);
-      const ignoredReason = ignoredPathReason(normalizedPath);
-      if (ignoredReason) {
-        return `error: refused to write ${normalizedPath} (${ignoredReason})`;
-      }
-
-      // Strip markdown code fences (```language ... ```)
-      let code = content.trim();
-      const fenceMatch = code.match(/```(?:\w+)?\s*\n([\s\S]*?)\n\s*```/);
-      if (fenceMatch) {
-        code = fenceMatch[1]!;
-      } else if (code.startsWith("```") && code.endsWith("```")) {
-        // Single-line fence?
-        code = code.slice(3, -3).trim();
-      }
-
-      // Write the file
-      await fs.writeFile(normalizedPath, code, "utf-8");
-      return `ok: wrote ${code.split("\n").length} lines to ${normalizedPath}`;
+    // Remove an outer code fence ONLY if the entire response is wrapped
+    let final = trimmed;
+    // Pattern: entire string is a single fenced block
+    const wholeFenceRegex = /^```(?:\w*)\s*\n([\s\S]*)\n\s*```$/;
+    const wholeMatch = final.match(wholeFenceRegex);
+    if (wholeMatch) {
+      final = wholeMatch[1]!;
     }
 
-    return content;
+    await fs.writeFile(normalizedPath, final, "utf-8");
+    const lines = final.split("\n").length;
+    return `ok: wrote ${lines} lines to ${normalizedPath}`;
   } catch (err: any) {
     return `Error calling Ollama subagent: ${err.message ?? err}`;
   }
@@ -638,15 +637,25 @@ const TOOLS: Record<string, ToolEntry> = {
   },
   ollama_code: {
     description:
-      "Subagent: Use Ollama only for code generation/editing/refactoring tasks after planning is done by the main model. Provide the exact implementation task, file content (if small), and constraints. If a `file_path` is given, the generated code will be written directly to that file (overwrites if exists).",
+      "Subagent: Use Ollama only for code generation/editing/refactoring tasks. Provide the target file_path; the result will be written directly to that file.",
     inputSchema: {
       type: "object",
       properties: {
-        instruction: { type: "string", description: "The coding task or prompt to send to Ollama." },
-        file_context: { type: "string", description: "Optional: Content of relevant files if small enough. Format: '--- FILE PATH ---\\ncontent\\n--- END ---'." },
-        file_path: { type: "string", description: "Optional: target file path relative to CWD. If set, the generated code is written to this file." },
+        instruction: {
+          type: "string",
+          description: "The coding task or prompt to send to Ollama.",
+        },
+        file_context: {
+          type: "string",
+          description:
+            "Optional: Content of relevant files if small enough. Format: '--- FILE PATH ---\\ncontent\\n--- END ---'.",
+        },
+        file_path: {
+          type: "string",
+          description: "REQUIRED: target file path relative to CWD. The generated code will be written here.",
+        },
       },
-      required: ["instruction"],
+      required: ["instruction", "file_path"],
     },
     fn: toolOllamaCode,
   },
@@ -704,13 +713,13 @@ function convertMessagesForProvider(
         const tool_calls =
           toolUses.length > 0
             ? toolUses.map((tu) => ({
-                id: tu.id,
-                type: "function" as const,
-                function: {
-                  name: tu.name,
-                  arguments: JSON.stringify(tu.input),
-                },
-              }))
+              id: tu.id,
+              type: "function" as const,
+              function: {
+                name: tu.name,
+                arguments: JSON.stringify(tu.input),
+              },
+            }))
             : undefined;
 
         result.push({
@@ -1347,14 +1356,16 @@ async function main() {
 
   const messages: Message[] = [];
   const systemPrompt = `cwd: ${CWD}.
-  You are a professional coding assistant. Your role is to understand the user's request, gather necessary context via tools, and deliver concrete results.
+  You are a precise coding assistant. Understand the user’s request, gather context with tools, and deliver concrete, correct results.
   
-  When using the ollama_code tool:
-  - If you supply a "file_path" argument, the generated code is written directly. You do not need to call write/edit afterwards.
-  - If you do NOT supply "file_path", the tool returns the code. You must immediately apply it with write or edit.
+  When you need to generate or change code:
+   • Always use the **ollama_code** tool and provide a concrete **file_path**.
+   • The tool writes the file directly – you do NOT need to call write/edit afterwards.
+   • After the tool succeeds, reply with a brief summary of what file was created/updated.
   
-  After any tool usage (including ollama_code), respond with a one‑sentence summary of what was done. Do NOT repeat your role or ask for further tasks. Wait for the user's next instruction.
-  `;
+  When you need to investigate, use read/glob/grep/bash freely.
+  
+  After any tool response, reply concisely and wait for the user’s next instruction.`;
 
   const promptStr = `${BOLD}${BLUE}❯${RESET} `;
 
