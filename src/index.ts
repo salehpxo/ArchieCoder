@@ -542,6 +542,38 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
   }
 }
 
+async function toolOllamaBatch(args: Record<string, JsonValue>): Promise<string> {
+  const tasks = args.tasks as any[] | undefined;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return "error: tasks array is required and must not be empty";
+  }
+
+  const results: string[] = [];
+  for (let i = 0; i < tasks.length; i++) {
+    const task = tasks[i]!;
+    const instruction = task.instruction as string;
+    const filePath = task.file_path as string;
+    const fileContext = (task.file_context as string) ?? "";
+
+    if (!instruction || !filePath) {
+      results.push(`[${i + 1}/${tasks.length}] ❌ skipped – missing instruction or file_path`);
+      continue;
+    }
+
+    console.log(`  ${DIM}── batch task ${i + 1}/${tasks.length}: ${filePath}${RESET}`);
+    const singleResult = await toolOllamaCode({ instruction, file_path: filePath, file_context: fileContext });
+    // Strip the leading "ok: wrote …" / error part to get a short status
+    const shortStatus = singleResult.startsWith("ok:")
+      ? singleResult.split("to ").pop() ?? singleResult
+      : singleResult.startsWith("error:")
+      ? `❌ ${singleResult.slice(7)}`
+      : singleResult;
+    results.push(`[${i + 1}/${tasks.length}] ${shortStatus}`);
+  }
+
+  return `Batch complete:\n${results.join("\n")}`;
+}
+
 // ---------------------------------------------------------------------------
 // Tool registry
 // ---------------------------------------------------------------------------
@@ -661,6 +693,30 @@ const TOOLS: Record<string, ToolEntry> = {
       required: ["instruction", "file_path"],
     },
     fn: toolOllamaCode,
+  },
+  ollama_batch: {
+    description:
+      "Subagent batch: Use Ollama for multiple code generation/editing tasks in sequence. Each task requires instruction and file_path. Tasks are queued and executed one at a time (hardware-friendly).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tasks: {
+          type: "array",
+          description: "Array of tasks, each with instruction, file_path, and optional file_context.",
+          items: {
+            type: "object",
+            properties: {
+              instruction: { type: "string", description: "The coding task for this file." },
+              file_path: { type: "string", description: "Target file path." },
+              file_context: { type: "string", description: "Optional: relevant file content." },
+            },
+            required: ["instruction", "file_path"],
+          },
+        },
+      },
+      required: ["tasks"],
+    },
+    fn: toolOllamaBatch,
   },
 };
 
@@ -1429,9 +1485,10 @@ async function main() {
   You are a precise coding assistant. Understand the user’s request, gather context with tools, and deliver concrete, correct results.
   
   When you need to generate or change code:
-   • Always use the **ollama_code** tool and provide a concrete **file_path**.
-   • The tool writes the file directly – you do NOT need to call write/edit afterwards.
-   • After the tool succeeds, reply with a brief summary of what file was created/updated.
+   • For a single file, use **ollama_code** with a concrete **file_path**.
+   • For multiple files, use **ollama_batch** with a **tasks** array. Each task requires instruction and file_path.
+   • These tools write files directly – you do NOT need to call write/edit afterwards.
+   • After the tool succeeds, reply with a brief summary of what was created/updated.
   
   When you need to investigate, use read/glob/grep/bash freely.
   
@@ -1521,6 +1578,10 @@ ${GREEN}Input features:${RESET}
               console.log(`\n${YELLOW}── ollama_code output ──${RESET}`);
               console.log(result);
               console.log(`${YELLOW}── end of output ──${RESET}`);
+            } else if (toolName === "ollama_batch" && result && !result.startsWith("Error")) {
+              console.log(`\n${YELLOW}── batch result ──${RESET}`);
+              console.log(result);
+              console.log(`${YELLOW}── end of batch ──${RESET}`);
             }
 
             toolResults.push({
