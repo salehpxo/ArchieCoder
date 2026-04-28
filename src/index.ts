@@ -529,6 +529,7 @@ async function callOllamaChatStream(
   return fullContent;
 }
 
+// -------------------- new toolOllamaCode --------------------
 async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> {
   const instruction = args.instruction as string;
   const fileContext = (args.file_context as string) ?? "";
@@ -544,47 +545,111 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
     return `error: refused to write ${normalizedPath} (${reason})`;
   }
 
-  // Read existing file content if the file exists (for editing purposes)
-  let existingContent = "";
+  // Determine if the file already exists (edit mode) or is new
   const fileExists = existsSync(normalizedPath);
+  let existingContent = "";
+
   if (fileExists) {
     try {
       const stats = await fs.stat(normalizedPath);
       if (stats.size <= MAX_READ_BYTES) {
         existingContent = await fs.readFile(normalizedPath, "utf-8");
+      } else {
+        return `error: file ${normalizedPath} is too large (${stats.size} bytes)`;
       }
-    } catch {
-      // If read fails, proceed without it
+    } catch (err: any) {
+      return `error: could not read ${normalizedPath}: ${err.message ?? err}`;
     }
   }
 
+  // ---- System prompt for the subagent ----
   const systemMsg = {
     role: "system",
-    content:
-      "You are an expert coding assistant. Perform concrete implementation tasks. Provide ONLY the final, complete file content – never return only a snippet or explanation. If you are modifying an existing file, you must output the whole file with the changes applied.",
+    content: fileExists
+      ? [
+          "You are an expert coding editor. You edit EXISTING files using SEARCH/REPLACE blocks.",
+          "Rules:",
+          "1. NEVER output the full file. Only output one or more SEARCH/REPLACE blocks.",
+          "2. Block format:",
+          "<<<<<<< SEARCH",
+          "exact text to find (must match the file exactly, including indentation)",
+          "=======",
+          "replacement text",
+          ">>>>>>> REPLACE",
+          "3. The SEARCH block must be an exact, unique substring of the current file.",
+          "4. If multiple changes are needed, use multiple SEARCH/REPLACE blocks.",
+          "5. DO NOT include any explanation, markdown fences, or extra commentary.",
+        ].join("\n")
+      : [
+          "You are an expert coding assistant. Create a NEW file from scratch.",
+          "Give ONLY the final, complete file content.",
+          "Do NOT include markdown fences, explanations, or extra text.",
+        ].join("\n"),
   };
 
+  // ---- User message ----
   let userContent = `Task: ${instruction}\nFile: ${normalizedPath}\n`;
   if (fileContext) {
-    userContent += `Additional context from user:\n${fileContext}\n`;
+    userContent += `Additional context:\n${fileContext}\n`;
   }
-  if (existingContent) {
-    userContent += `Current file content:\n'''\n${existingContent}\n'''\n`;
+  if (fileExists) {
+    userContent += `Current file content:\n\`\`\`\n${existingContent}\n\`\`\`\n`;
+    userContent += `\nOutput the SEARCH/REPLACE blocks for the required changes.`;
+  } else {
+    userContent += `Output the complete file content.`;
   }
-  userContent += `Output the ENTIRE file content after applying the requested changes. Do not include markdown fences.`;
 
-  const messages = [systemMsg, { role: "user", content: userContent }];
+  const messages: any[] = [systemMsg, { role: "user", content: userContent }];
 
+  // ---- Call Ollama and get the response ----
+  process.stdout.write("\n");
+  let rawOutput: string;
   try {
-    const content = await callOllamaChatStream(messages, OLLAMA_MODEL);
+    rawOutput = await callOllamaChatStream(messages, OLLAMA_MODEL);
+  } catch (err: any) {
+    return `Error calling Ollama subagent: ${err.message ?? err}`;
+  }
 
-    const trimmed = content.trim();
-    if (!trimmed) {
-      return "error: ollama_code returned empty content";
+  if (!rawOutput || rawOutput.trim().length === 0) {
+    return "error: ollama_code returned empty response";
+  }
+
+  // ---- Handle response ----
+  if (fileExists) {
+    // ---------- Edit mode: parse SEARCH/REPLACE blocks ----------
+    const blocks = parseSearchReplaceBlocks(rawOutput);
+
+    if (blocks.length === 0) {
+      return `error: ollama_code did not produce any valid SEARCH/REPLACE block.\nModel response:\n"""\n${rawOutput}\n"""`;
     }
 
-    // Remove outer code fence only if the entire response is wrapped
-    let final = trimmed;
+    // Apply each block sequentially using the edit tool
+    const results: string[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i]!;
+      // Use the existing edit tool – it does exact match and reports errors
+      const editResult = await toolEdit({
+        path: normalizedPath,
+        old: block.search,
+        new: block.replace,
+      });
+
+      if (editResult.startsWith("error:")) {
+        results.push(
+          `SEARCH/REPLACE block ${i + 1} failed:\n  SEARCH:\n"""\n${block.search}\n"""\n  ERROR: ${editResult}`
+        );
+        // stop on first failure to avoid corrupting the file further
+        return `error: ${results.join("\n")}`;
+      }
+
+      results.push(`SEARCH/REPLACE block ${i + 1} applied successfully.`);
+    }
+
+    return `ok: applied ${blocks.length} edit block(s) to ${normalizedPath}`;
+  } else {
+    // ---------- New file mode: use whole content ----------
+    let final = rawOutput.trim();
+    // Remove outer code fence if the entire response is wrapped
     const wholeFenceRegex = /^```(?:\w*)\s*\n([\s\S]*)\n\s*```$/;
     const wholeMatch = final.match(wholeFenceRegex);
     if (wholeMatch) {
@@ -594,9 +659,33 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
     await fs.writeFile(normalizedPath, final, "utf-8");
     const lines = final.split("\n").length;
     return `ok: wrote ${lines} lines to ${normalizedPath}`;
-  } catch (err: any) {
-    return `Error calling Ollama subagent: ${err.message ?? err}`;
   }
+}
+
+/**
+ * Parse SEARCH/REPLACE blocks from a string.
+ * Expected format:
+ * <<<<<<< SEARCH
+ * ... search text ...
+ * =======
+ * ... replace text ...
+ * >>>>>>> REPLACE
+ *
+ * Multiple blocks are allowed; the markers must appear on their own lines.
+ * Trailing whitespace on marker lines is allowed.
+ */
+function parseSearchReplaceBlocks(text: string): { search: string; replace: string }[] {
+  const blocks: { search: string; replace: string }[] = [];
+  const regex = /<<<<<<< SEARCH\s*\n([\s\S]*?)\n?=======\s*\n([\s\S]*?)\n?>>>>>>> REPLACE/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    const search = match[1] ?? "";
+    const replace = match[2] ?? "";
+    blocks.push({ search, replace });
+  }
+
+  return blocks;
 }
 
 async function toolOllamaBatch(args: Record<string, JsonValue>): Promise<string> {
