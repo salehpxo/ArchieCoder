@@ -1,201 +1,240 @@
+
+<h1 align="center">
+  <br>
+  <pre>
+   _                         _           _
+  | |                       | |         | |
+  | |__   ___ _ __  ___  ___| | ___  ___| |___
+  | '_ \ / _ \ '_ \/ __|/ __| |/ _ \/ __| / __|
+  | | | |  __/ | | \__ \ (__| | (_) \__ \ \__ \
+  |_| |_|\___|_| |_|___/\___|_|\___/|___/_|___/
+  </pre>
+  <br>
+  archiecoder
+</h1>
+
 <p align="center">
-  <img src="https://img.shields.io/badge/status-beta-blue?style=flat-square" alt="Status: Beta">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue?style=flat-square" alt="Version">
-  <img src="https://img.shields.io/badge/license-ISC-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/Node-%3E%3D18-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node >= 18">
-  <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript">
+  <strong>A minimal Claude Code alternative — written in TypeScript</strong>
+  <br>
+  <sub>Agentic coding assistant for your terminal, powered by any OpenAI-compatible API or local Ollama models.</sub>
 </p>
 
-<h1 align="center">⚡ archiecoder</h1>
-
 <p align="center">
-  <em>A minimal, terminal-native AI coding assistant — like Claude Code, but your stack, your API, your rules.</em>
+  <code>pnpm dev</code> &nbsp;·&nbsp; <code>@mention</code> &nbsp;·&nbsp; <code>read</code> &nbsp;·&nbsp; <code>write</code> &nbsp;·&nbsp; <code>edit</code> &nbsp;·&nbsp; <code>glob</code> &nbsp;·&nbsp; <code>grep</code> &nbsp;·&nbsp; <code>bash</code> &nbsp;·&nbsp; <code>ollama_code</code>
 </p>
-
-<br/>
 
 ---
 
 ## ✨ Features
 
-| | Feature | Description |
-|---|---|---|
-| 🔌 | **Any API** | OpenAI, OpenRouter, Anthropic, Ollama — any OpenAI-compatible or Ollama-native endpoint |
-| 🛠️ | **7 Built-in Tools** | `read` · `write` · `edit` · `glob` · `grep` · `bash` · `ollama_code` |
-| 🧠 | **Ollama Subagent** | Offload code generation to a local Ollama model via the `ollama_code` tool |
-| 🎨 | **Beautiful Terminal UI** | ANSI colors, markdown rendering, live tool output streaming |
-| 📁 | **@-File Mentions** | Type `@` to autocomplete project file paths — instant context injection |
-| 📝 | **Multi-line Input** | Full keybindings: arrows, home/end, shift+enter for newlines |
-| 🔧 | **Zero Config** | Drop a `.env` file with your `API_KEY` and go |
-| 🧹 | **Smart Ignore** | Auto-skips `node_modules`, `.git`, binaries, lockfiles, and more |
+| | |
+|---|---|
+| 🧠 **LLM-Agent Loop** | Multi-turn conversation with tool-calling — the LLM reads, writes, edits, searches, and runs commands autonomously. |
+| 🎨 **Rich Terminal UI** | ANSI colors, markdown rendering, dimmed separators, and a live status line. |
+| 🔍 **`@mention` File Picker** | Type `@` to fuzzy-find and attach any project file as context — works with arrow keys + Enter. |
+| 🔧 **7 Built-in Tools** | `read`, `write`, `edit`, `glob`, `grep`, `bash`, and `ollama_code` (subagent for local code gen). |
+| 🌐 **Multi-Provider** | Works with **OpenRouter**, **OpenAI**, **Anthropic**, **DeepSeek**, or **Ollama** — just swap the `API_URL`. |
+| 🏠 **Local-First** | Auto-detects Ollama's native `/api/chat` endpoint and uses tool-calling natively. |
+| 📎 **File Context** | `@`-mention any file in your project — its contents are attached into the prompt automatically. |
+| 🧹 **Sensible Ignore** | Skips `node_modules`, `.git`, `dist`, binaries, lock files, images, and more automatically. |
+| ⚡ **Single File** | Everything is in one self-contained `src/index.ts` — easy to read, hack, and extend. |
 
 ---
 
-## 🚀 Quick Start
+## 🧰 Prerequisites
+
+- **Node.js** ≥ 18 (built-in `fetch`)
+- **pnpm** (or npm / yarn — lockfile is `pnpm-lock.yaml`)
+- **Ollama** *(optional)* — only if you want to run the `ollama_code` subagent or use a local model as the main LLM
+
+---
+
+## 📦 Installation
 
 ```bash
-# Clone & install
-git clone <repo-url> && cd archiecoder
+# Clone the repo
+git clone <repo-url> archiecoder
+cd archiecoder
+
+# Install dependencies
 pnpm install
 
-# Configure your API key
-echo "API_KEY=sk-..." > .env
+# (Optional) Create a .env file
+echo 'API_KEY=your-api-key-here' > .env
+echo 'API_URL=https://openrouter.ai/api/v1/chat/completions' >> .env
+echo 'MODEL=deepseek-v4-flash' >> .env
+```
 
-# Run
+---
+
+## 🚀 Usage
+
+### Run in development mode
+
+```bash
 pnpm dev
 ```
 
-That's it. You're talking to an AI coding assistant in your terminal.
-
----
-
-## ⚙️ Configuration
-
-archiecoder reads from a `.env` file (or environment variables):
-
-| Variable | Default | Required | Description |
-|---|---|---|---|
-| `API_KEY` | — | ✅ | Your API key (OpenRouter, OpenAI, etc.) |
-| `API_URL` | `https://openrouter.ai/api/v1/chat/completions` | | Chat completions endpoint |
-| `MODEL` | `deepseek-v4-flash` | | Model name to use |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | | Ollama server URL (only used with Ollama endpoints) |
-| `OLLAMA_MODEL` | `qwen3.5:0.8b` | | Model for the `ollama_code` subagent |
-
-**Example `.env`:**
-
-```
-API_KEY=sk-or-v1-your-openrouter-key
-API_URL=https://openrouter.ai/api/v1/chat/completions
-MODEL=anthropic/claude-sonnet-20241022
-```
-
-Or for **Ollama**:
-
-```
-API_URL=http://localhost:11434/api/chat
-OLLAMA_MODEL=llama3.2:3b
-```
-
----
-
-## 🎮 Usage
+### Build & run in production
 
 ```bash
-pnpm dev          # Run in development mode (tsx watch)
-pnpm start        # Run compiled JS from dist/
-pnpm build        # Compile TypeScript
+pnpm build
+pnpm start
 ```
 
-### Commands
+### Interactive Commands
 
 | Command | Action |
-|---|---|
-| `/q` or `exit` | Quit the assistant |
-| `/c` | Clear conversation history |
-| `@<filepath>` | Mention a file to attach its contents as context |
+|---------|--------|
+| `/q` or `exit` | Quit the program |
+| `/c` | Clear the conversation history |
 
-### Keybindings (input mode)
+### `@mention` Files
 
-| Key | Action |
-|---|---|
-| `Enter` | Submit message |
-| `Shift+Enter` | New line |
-| `↑` / `↓` | Navigate lines / mention suggestions |
-| `←` / `→` | Move cursor |
-| `Home` / `End` | Jump to start / end of line |
-| `Esc` | Close file mention picker |
-| `Tab` / `Enter` (in picker) | Accept file suggestion |
-| `Ctrl+C` | Exit |
-| `Ctrl+D` | Send empty / exit |
+While typing, use `@` followed by a file path to attach its content as context:
+
+```
+> fix the bug in @src/index.ts
+```
+
+Press **Tab** or **Enter** to accept a suggestion, **↑/↓** to navigate, **Esc** to close the picker.
 
 ---
 
-## 🛠️ Tools Reference
+## 🔧 Environment Variables
 
-archiecoder equips the AI with these tools to interact with your codebase:
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `API_KEY` | ✅ **Yes** | — | API key for the remote provider (e.g., OpenRouter, OpenAI) |
+| `API_URL` | ❌ No | `https://openrouter.ai/api/v1/chat/completions` | Chat completions endpoint (OpenAI-compatible or Ollama `/api/chat`) |
+| `MODEL` | ❌ No | `deepseek-v4-flash` | Model name to use |
+| `OLLAMA_BASE_URL` | ❌ No | `http://localhost:11434` | Base URL for local Ollama instance |
+| `OLLAMA_MODEL` | ❌ No | `qwen3.5:0.8b` | Ollama model used by the `ollama_code` subagent |
 
-| Tool | Description | Parameters |
+> The tool reads a `.env` file in the project root if one exists — no dotenv dependency needed.
+
+---
+
+## 🛠️ Built-in Tools
+
+Every tool is exposed to the LLM agent and can be invoked autonomously during a conversation.
+
+| Tool | Description | Key Parameters |
 |---|---|---|
-| `read` | Read a file with line numbers | `path`, `offset?`, `limit?` |
-| `write` | Write content to a file | `path`, `content` |
-| `edit` | Replace text in a file (unique match or `all=true`) | `path`, `old`, `new`, `all?` |
-| `glob` | Find files by glob pattern (sorted by mtime) | `pat`, `path?` |
-| `grep` | Search file contents by regex (max 50 results) | `pat`, `path?` |
-| `bash` | Run a shell command (30s timeout, live output) | `cmd` |
-| `ollama_code` | Subagent: delegate code gen to a local Ollama model | `instruction`, `file_context?`, `file_path?` |
-
-Each tool result is shown inline with a preview, so you stay in the flow.
+| `read` | Read file with line numbers | `path` (required), `offset`, `limit` |
+| `write` | Write content to a file | `path` (required), `content` (required) |
+| `edit` | Replace text in a file | `path` (required), `old` (required), `new` (required), `all` |
+| `glob` | Find files by pattern (sorted by mtime) | `pat` (required), `path` |
+| `grep` | Search files by regex pattern | `pat` (required), `path` |
+| `bash` | Run a shell command (30s timeout) | `cmd` (required) |
+| `ollama_code` | Subagent — delegates code gen to local Ollama | `instruction` (required), `file_path` (required), `file_context` |
 
 ---
 
-## 📁 File Mentions (`@`)
-
-Type `@` while typing to trigger the **file picker**:
+## 🏗️ Architecture
 
 ```
-❯ Refactor the database layer in @src/db
+┌──────────────────────────────────────────────────┐
+│                    Main Loop                      │
+│                                                  │
+│   ┌────────┐    ┌──────────┐    ┌─────────────┐ │
+│   │  ask()  │───▶│ callApi() │───▶│  runTool() │ │
+│   │ (input) │    │ (LLM)    │    │ (execution) │ │
+│   └────────┘    └──────────┘    └──────┬──────┘ │
+│                                        │        │
+│                              ┌─────────▼──────┐ │
+│                              │  Tool Registry │ │
+│                              │ read · write   │ │
+│                              │ edit · glob    │ │
+│                              │ grep · bash    │ │
+│                              │ ollama_code    │ │
+│                              └────────────────┘ │
+└──────────────────────────────────────────────────┘
 ```
 
-- As you type after `@`, archiecoder filters project files (fuzzy matching)
-- `↑`/`↓` to navigate suggestions, `Enter` or `Tab` to select
-- Press `Esc` to close the picker
-- Selected files are read and attached as context to the AI
+**Single file, modular internals:**
 
-This makes it effortless to reference existing code without copy-pasting.
-
----
-
-## 🧠 Ollama Subagent
-
-The `ollama_code` tool lets the main AI delegate concrete coding tasks to a **local Ollama model**. This is useful for:
-
-- Writing boilerplate code
-- Refactoring small functions
-- Generating test cases
-- Performing quick edits without consuming API tokens
-
-Configure it via `OLLAMA_BASE_URL` and `OLLAMA_MODEL` in your `.env`.
+| Section | Lines | Purpose |
+|---|---|---|
+| ANSI Styling | ~25 | Terminal color constants |
+| Config & Env | ~30 | Load `.env`, set defaults |
+| Ollama Detection | ~15 | Auto-detect `/api/chat` endpoint |
+| Glob / Walk / Ignore | ~120 | File system helpers with smart ignore lists |
+| Tool Implementations | ~230 | All 7 tool functions |
+| API Call | ~180 | Provider abstraction (OpenAI / Ollama) |
+| Input Editor (`ask()`) | ~330 | Multi-line terminal with `@mention` file picker |
+| Main Loop | ~100 | Conversation orchestration |
 
 ---
 
-## 📂 Project Structure
+## 🔄 How It Works
+
+1. **You type** a prompt (optionally `@mention`-ing files for context).
+2. **The LLM responds** — either with text or by requesting a tool call.
+3. **If a tool call** is requested, the tool runs locally and the result is fed back to the LLM.
+4. **The LLM continues** looping until it produces a final text response.
+5. **You see** the response rendered with markdown formatting in your terminal.
+
+This agent loop means the LLM can autonomously read your codebase, search for patterns, write new files, edit existing ones, run shell commands, and even delegate sub-tasks to a local Ollama model — all within a single conversation turn.
+
+---
+
+## 📁 Project Structure
 
 ```
 archiecoder/
 ├── src/
-│   └── index.ts          # ~1400 lines, zero-dependency runtime
-├── dist/                 # Compiled output (tsc)
-├── .env                  # Your API configuration (gitignored)
+│   └── index.ts          # The entire application (single file)
+├── .env                  # Environment variables (optional)
 ├── .gitignore
-├── package.json
+├── package.json          # Dependencies & scripts
 ├── pnpm-lock.yaml
-├── tsconfig.json
-└── README.md
+├── tsconfig.json         # TypeScript configuration
+└── README.md             # This file
 ```
-
-> **Zero runtime dependencies.** The only packages are dev-only: `typescript`, `tsx`, and `@types/node`.
 
 ---
 
-## 🧰 Tech Stack
+## 🧪 Demo
 
-| Layer | Choice |
-|---|---|
-| Language | TypeScript (strict, ESM) |
-| Runtime | Node.js ≥ 18 (built-in `fetch`) |
-| Package Manager | pnpm |
-| Build | `tsc` + `tsx` for dev |
-| API Protocols | OpenAI-compatible `/v1/chat/completions` + Ollama `/api/chat` |
-| Terminal UI | Raw ANSI escape codes (no lib) |
+```
+┌──────────────────────────────────────────────────────────┐
+│  archiecoder | deepseek-v4-flash | /Users/me/project       │
+│                                                          │
+│  ──────────────────────────────────────────────────────── │
+│  ❯ add a helper function to parse CSV in @src/index.ts   │
+│  ──────────────────────────────────────────────────────── │
+│                                                          │
+│  ⏺ Read(src/index.ts)                                    │
+│    ⎿   1| #!/usr/bin/env -S npx tsx ...                  │
+│                                                          │
+│  ⏺ Let me look at the current file structure first.      │
+│                                                          │
+│  ⏺ I'll add a parseCSV function at the bottom...         │
+│                                                          │
+│  ⏺ OllamaCode(instruction=..., file_path=src/index.ts)   │
+│    ⎿ ok: wrote 12 lines to src/index.ts                  │
+│                                                          │
+│  ── ollama_code output ──                                 │
+│  ok: wrote 12 lines to src/index.ts                      │
+│  ── end of output ──                                      │
+│                                                          │
+│  ⏺ ✅ Done! Added a parseCSV() utility at the end of     │
+│     src/index.ts. It uses Papa Parse-style logic with     │
+│     quote escaping and header extraction.                 │
+└──────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 📄 License
 
-ISC — do what you want.
+**ISC** — see [package.json](./package.json).
 
 ---
 
 <p align="center">
-  <sub>Built with ❤️ for developers who prefer their AI assistant in a terminal.</sub>
+  Built with ❤️ using TypeScript
+  <br>
+  <sub>zero bloat, maximum power.</sub>
 </p>
