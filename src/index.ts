@@ -6,10 +6,12 @@
  *   Node.js >= 18 (built‑in fetch)
  *
  * Environment variables:
- *   API_KEY   – your API key (required)
- *   API_URL   – chat completions endpoint
- *               (default: https://openrouter.ai/api/v1/chat/completions)
- *   MODEL     – model name (default: deepseek-v4-flash)
+ *   API_KEY           – your API key (required for remote providers)
+ *   API_URL           – chat completions endpoint
+ *                       (default: https://openrouter.ai/api/v1/chat/completions)
+ *   MODEL             – model name (default: deepseek-v4-flash)
+ *   OLLAMA_BASE_URL   – Ollama base URL (default: http://localhost:11434)
+ *                         Only used when API_URL points to an Ollama endpoint
  */
 
 import * as fs from "node:fs/promises";
@@ -56,6 +58,30 @@ const API_URL =
 const MODEL = process.env.MODEL ?? "deepseek-v4-flash";
 const CWD = process.cwd();
 const TERMINAL_WIDTH = process.stdout.columns ?? 80;
+
+// ---------------------------------------------------------------------------
+// Ollama detection & config
+// ---------------------------------------------------------------------------
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen3.5:0.8b";
+
+/** Return true when API_URL looks like an Ollama endpoint. */
+function isOllamaUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    // Only match native /api/chat on local instances
+      console.log("🚀 ~ isOllamaUrl ~ u.hostname:", u.hostname)
+    return (
+      (u.hostname === "localhost" || u.hostname === "127.0.0.1") &&
+      u.pathname === "/api/chat"
+    );
+  } catch {
+    return false;
+  }
+}
+
+const IS_OLLAMA = isOllamaUrl(API_URL);
+console.log("🚀 ~ IS_OLLAMA:", IS_OLLAMA)
 
 // ---------------------------------------------------------------------------
 // Types
@@ -416,6 +442,105 @@ async function toolBash(args: Record<string, JsonValue>): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Ollama Subagent Helpers
+// ---------------------------------------------------------------------------
+async function callOllamaChat(messages: Record<string, any>[], model: string): Promise<any> {
+  const baseUrl = OLLAMA_BASE_URL.replace(/\/+$/, "");
+  const url = `${baseUrl}/api/chat`;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  const body = {
+    model,
+    messages: messages,
+    stream: false,
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Ollama chat error ${response.status}: ${errorText}`);
+  }
+
+  const raw: any = await response.json();
+  console.log("🚀 ~ callOllamaChat ~ raw:", raw)
+  return raw.message;
+}
+
+async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> {
+  const instruction = args.instruction as string;
+  const fileContext = (args.file_context as string) ?? "";
+  const filePath = args.file_path as string | undefined;
+
+  const systemMsg = {
+    role: "system",
+    content:
+      "You are an expert coding assistant using Ollama. Only perform coding execution tasks such as writing code, editing code, refactoring snippets, or generating concrete implementation output. Do not do high-level planning, architecture decisions, or broad solution exploration. If file context is provided, use it to ensure accuracy. If the user wants to edit a file, provide the full corrected content or precise patch-style instructions.",
+  };
+
+  let userContent = `Task: ${instruction}\n\n`;
+  if (fileContext) {
+    userContent += `Relevant File Context:\n${fileContext}\n\n`;
+  }
+  userContent += `Please provide concrete code output for the requested implementation task only.`;
+
+  const messages = [systemMsg, { role: "user", content: userContent }];
+
+  try {
+    const responseMsg = await callOllamaChat(messages, OLLAMA_MODEL);
+    // Normalise the response to a string
+    let content: string = "";
+    if (typeof responseMsg === "string") {
+      content = responseMsg;
+    } else if (typeof responseMsg?.content === "string") {
+      content = responseMsg.content;
+    } else if (typeof responseMsg?.message?.content === "string") {
+      content = responseMsg.message.content;
+    } else {
+      content = JSON.stringify(responseMsg);
+    }
+
+    if (!content.trim()) {
+      content = "No response generated.";
+    }
+
+    // If a file_path was provided, clean up code fences and write the file
+    if (filePath) {
+      const normalizedPath = normalizeToolPath(filePath);
+      const ignoredReason = ignoredPathReason(normalizedPath);
+      if (ignoredReason) {
+        return `error: refused to write ${normalizedPath} (${ignoredReason})`;
+      }
+
+      // Strip markdown code fences (```language ... ```)
+      let code = content.trim();
+      const fenceMatch = code.match(/```(?:\w+)?\s*\n([\s\S]*?)\n\s*```/);
+      if (fenceMatch) {
+        code = fenceMatch[1]!;
+      } else if (code.startsWith("```") && code.endsWith("```")) {
+        // Single-line fence?
+        code = code.slice(3, -3).trim();
+      }
+
+      // Write the file
+      await fs.writeFile(normalizedPath, code, "utf-8");
+      return `ok: wrote ${code.split("\n").length} lines to ${normalizedPath}`;
+    }
+
+    return content;
+  } catch (err: any) {
+    return `Error calling Ollama subagent: ${err.message ?? err}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tool registry
 // ---------------------------------------------------------------------------
 type ToolFn = (args: Record<string, JsonValue>) => Promise<string>;
@@ -511,6 +636,20 @@ const TOOLS: Record<string, ToolEntry> = {
     },
     fn: toolBash,
   },
+  ollama_code: {
+    description:
+      "Subagent: Use Ollama only for code generation/editing/refactoring tasks after planning is done by the main model. Provide the exact implementation task, file content (if small), and constraints. If a `file_path` is given, the generated code will be written directly to that file (overwrites if exists).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        instruction: { type: "string", description: "The coding task or prompt to send to Ollama." },
+        file_context: { type: "string", description: "Optional: Content of relevant files if small enough. Format: '--- FILE PATH ---\\ncontent\\n--- END ---'." },
+        file_path: { type: "string", description: "Optional: target file path relative to CWD. If set, the generated code is written to this file." },
+      },
+      required: ["instruction"],
+    },
+    fn: toolOllamaCode,
+  },
 };
 
 function makeToolDefinitions(): ToolDefinition[] {
@@ -593,21 +732,98 @@ async function callApi(
   messages: Message[],
   systemPrompt: string
 ): Promise<CallApiResult> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${API_KEY}`,
-  };
-
   const wireMessages = [
     { role: "system", content: systemPrompt },
     ...convertMessagesForProvider(messages),
   ];
 
+  const toolDefs = makeToolDefinitions();
+
+  // -----------------------------------------------------------------------
+  // Ollama native endpoint: /api/chat
+  // -----------------------------------------------------------------------
+  if (IS_OLLAMA && API_URL.includes("/api/chat")) {
+    const ollamaUrl = new URL(API_URL);
+    // If path is exactly /api/chat, keep it; otherwise use OLLAMA_BASE_URL
+    const baseUrl = ollamaUrl.pathname === "/api/chat"
+      ? OLLAMA_BASE_URL.replace(/\/+$/, "")
+      : OLLAMA_BASE_URL.replace(/\/+$/, "");
+
+    const ollamaRequestBody = {
+      model: MODEL,
+      messages: wireMessages,
+      tools: toolDefs.map((t) => ({
+        type: "function",
+        function: {
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        },
+      })),
+      stream: false,
+    };
+
+    const ollamaHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: "POST",
+      headers: ollamaHeaders,
+      body: JSON.stringify(ollamaRequestBody),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Ollama error ${response.status}: ${errorText}`);
+    }
+
+    const raw: any = await response.json();
+    const msg = raw.message ?? { role: "assistant", content: "" };
+    const rawAssistantMessage = msg as Record<string, any>;
+    const blocks: ContentBlock[] = [];
+
+    if (typeof msg.content === "string" && msg.content) {
+      blocks.push({ type: "text", text: msg.content });
+    }
+
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        const fn = tc.function ?? {};
+        blocks.push({
+          type: "tool_use",
+          id: tc.id ?? `ollama_${Date.now()}`,
+          name: fn.name ?? "",
+          input: typeof fn.arguments === "string"
+            ? JSON.parse(fn.arguments || "{}")
+            : fn.arguments ?? {},
+        });
+      }
+    }
+
+    return {
+      response: {
+        id: raw.id ?? `ollama_${Date.now()}`,
+        content: blocks,
+        stop_reason: raw.done ? "end_turn" : null,
+      },
+      rawAssistantMessage,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // OpenAI‑compatible endpoint (default path, including Ollama's /v1/…)
+  // -----------------------------------------------------------------------
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${API_KEY}`,
+  };
+
   const requestBody = {
     model: MODEL,
     max_tokens: 8192,
     messages: wireMessages,
-    tools: makeToolDefinitions(),
+    tools: toolDefs,
   };
 
   let response = await fetch(API_URL, {
@@ -1130,7 +1346,15 @@ async function main() {
   );
 
   const messages: Message[] = [];
-  const systemPrompt = `Concise coding assistant. cwd: ${CWD}. be professional and future-proof.`;
+  const systemPrompt = `cwd: ${CWD}.
+  You are a professional coding assistant. Your role is to understand the user's request, gather necessary context via tools, and deliver concrete results.
+  
+  When using the ollama_code tool:
+  - If you supply a "file_path" argument, the generated code is written directly. You do not need to call write/edit afterwards.
+  - If you do NOT supply "file_path", the tool returns the code. You must immediately apply it with write or edit.
+  
+  After any tool usage (including ollama_code), respond with a one‑sentence summary of what was done. Do NOT repeat your role or ask for further tasks. Wait for the user's next instruction.
+  `;
 
   const promptStr = `${BOLD}${BLUE}❯${RESET} `;
 
@@ -1181,6 +1405,12 @@ async function main() {
               preview += ` ... +${resultLines.length - 1} lines`;
             else if ((resultLines[0] ?? "").length > 60) preview += "...";
             console.log(`  ${DIM}⎿  ${preview}${RESET}`);
+
+            if (toolName === "ollama_code" && result && !result.startsWith("Error")) {
+              console.log(`\n${YELLOW}── ollama_code output ──${RESET}`);
+              console.log(result);
+              console.log(`${YELLOW}── end of output ──${RESET}`);
+            }
 
             toolResults.push({
               type: "tool_result",
