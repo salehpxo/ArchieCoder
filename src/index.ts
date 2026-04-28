@@ -59,6 +59,11 @@ const MODEL = process.env.MODEL ?? "deepseek-v4-flash";
 const CWD = process.cwd();
 const TERMINAL_WIDTH = process.stdout.columns ?? 80;
 
+// ----- Command history -----
+const inputHistory: string[] = [];
+let historyCursor = -1;
+let savedInputBeforeHistory: string | null = null;
+
 // ---------------------------------------------------------------------------
 // Ollama detection & config
 // ---------------------------------------------------------------------------
@@ -70,7 +75,6 @@ function isOllamaUrl(url: string): boolean {
   try {
     const u = new URL(url);
     // Only match native /api/chat on local instances
-    console.log("🚀 ~ isOllamaUrl ~ u.hostname:", u.hostname)
     return (
       (u.hostname === "localhost" || u.hostname === "127.0.0.1") &&
       u.pathname === "/api/chat"
@@ -81,7 +85,6 @@ function isOllamaUrl(url: string): boolean {
 }
 
 const IS_OLLAMA = isOllamaUrl(API_URL);
-console.log("🚀 ~ IS_OLLAMA:", IS_OLLAMA)
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1227,6 +1230,59 @@ async function ask(prompt: string): Promise<string> {
       input.pause();
     };
 
+    // ---- history navigation helpers (defined inside ask) ----
+    const navigateHistory = (direction: "up" | "down") => {
+      if (inputHistory.length === 0) return;
+      const { mention } = mentionState();
+      if (mention) return; // don't steal arrows from mention picker
+
+      // Only allow history navigation from the very start/end of the whole buffer
+      const isAtStart = cursor.line === 0 && cursor.col === 0;
+      const lastLineIdx = lines.length - 1;
+      const lastLine = lines[lastLineIdx] ?? "";
+      const isAtEnd = cursor.line === lastLineIdx && cursor.col === lastLine.length;
+
+      if (direction === "up" && !isAtStart) return;
+      if (direction === "down" && !isAtEnd) return;
+
+      if (direction === "up") {
+        if (historyCursor === -1) {
+          // Save current draft before moving into history
+          savedInputBeforeHistory = lines.join("\n");
+          historyCursor = inputHistory.length - 1;
+        } else if (historyCursor > 0) {
+          historyCursor--;
+        } else {
+          return; // already at oldest
+        }
+      } else {
+        // down
+        if (historyCursor === -1) return;
+        if (historyCursor < inputHistory.length - 1) {
+          historyCursor++;
+        } else {
+          // back to original draft
+          historyCursor = -1;
+          const restored = savedInputBeforeHistory ?? "";
+          savedInputBeforeHistory = null;
+          const restoredLines = restored.split("\n");
+          lines.length = 0;
+          for (const l of restoredLines) lines.push(l);
+          cursor.line = lines.length - 1;
+          cursor.col = (lines[cursor.line] ?? "").length;
+          return;
+        }
+      }
+
+      // Apply history entry
+      const entry = inputHistory[historyCursor]!;
+      const entryLines = entry.split("\n");
+      lines.length = 0;
+      for (const l of entryLines) lines.push(l);
+      cursor.line = lines.length - 1;
+      cursor.col = (lines[cursor.line] ?? "").length;
+    };
+
     const onKeypress = (str: string | undefined, key: any) => {
       if (!key) return;
       const { mention, suggestions } = mentionState();
@@ -1304,12 +1360,26 @@ async function ask(prompt: string): Promise<string> {
           cursor.col = 0;
         }
       } else if (key.name === "up") {
-        if (cursor.line > 0) {
+        const { mention } = mentionState();
+        if (mention && suggestions.length) {
+          selectedSuggestion =
+            (selectedSuggestion - 1 + suggestions.length) % suggestions.length;
+        } else if (cursor.line === 0 && cursor.col === 0) {
+          navigateHistory("up");
+        } else if (cursor.line > 0) {
           cursor.line--;
           cursor.col = Math.min(cursor.col, (lines[cursor.line] ?? "").length);
         }
       } else if (key.name === "down") {
-        if (cursor.line < lines.length - 1) {
+        const { mention } = mentionState();
+        if (mention && suggestions.length) {
+          selectedSuggestion = (selectedSuggestion + 1) % suggestions.length;
+        } else if (
+          cursor.line === lines.length - 1 &&
+          cursor.col === (lines[cursor.line] ?? "").length
+        ) {
+          navigateHistory("down");
+        } else if (cursor.line < lines.length - 1) {
           cursor.line++;
           cursor.col = Math.min(cursor.col, (lines[cursor.line] ?? "").length);
         }
@@ -1367,19 +1437,49 @@ async function main() {
   
   After any tool response, reply concisely and wait for the user’s next instruction.`;
 
-  const promptStr = `${BOLD}${BLUE}❯${RESET} `;
+  let sessionCount = 1;
+  const promptStr = () => `${BOLD}${CYAN}${path.basename(CWD)}${RESET} ${BLUE}#${sessionCount}${RESET} ${BOLD}${BLUE}❯${RESET} `;
 
   while (true) {
     try {
       console.log(separator());
-      const userInput = await ask(promptStr);
+      const userInput = await ask(promptStr());
       console.log(separator());
       const trimmed = userInput.trim();
       if (!trimmed) continue;
       if (trimmed === "/q" || trimmed === "exit") break;
-      if (trimmed === "/c") {
+      // -- history management --
+      if (trimmed && inputHistory[inputHistory.length - 1] !== trimmed) {
+        inputHistory.push(trimmed);
+      }
+      historyCursor = -1;
+      savedInputBeforeHistory = null;
+      if (trimmed === "/c" || trimmed === "/new") {
         messages.length = 0;
-        console.log(`${GREEN}⏺ Cleared conversation${RESET}`);
+        sessionCount++;
+        console.log(
+          `\n${BOLD}nanocode${RESET} | ${DIM}${MODEL}${RESET} | ${BOLD}${CYAN}${path.basename(CWD)}${RESET}\n`
+        );
+        continue;
+      }
+      if (trimmed === "/help") {
+        console.log(
+          `${GREEN}Commands:${RESET}
+  /c, /new    – start a fresh conversation
+  /q, exit    – quit
+  /help       – show this help
+
+${GREEN}Tools (called by the assistant automatically):${RESET}
+  read, write, edit, glob, grep, bash, ollama_code
+
+${GREEN}Input features:${RESET}
+  @filename   – fuzzy file picker (type @, arrows, Tab/Enter)
+  Up/Down     – command history (when cursor at very start/end)
+  Shift+Enter – insert newline
+  Ctrl+C      – quit
+  Ctrl+D      – cancel input
+  Ctrl+L      – clear screen`
+        );
         continue;
       }
 
