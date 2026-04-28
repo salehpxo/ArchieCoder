@@ -544,17 +544,34 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
     return `error: refused to write ${normalizedPath} (${reason})`;
   }
 
+  // Read existing file content if the file exists (for editing purposes)
+  let existingContent = "";
+  const fileExists = existsSync(normalizedPath);
+  if (fileExists) {
+    try {
+      const stats = await fs.stat(normalizedPath);
+      if (stats.size <= MAX_READ_BYTES) {
+        existingContent = await fs.readFile(normalizedPath, "utf-8");
+      }
+    } catch {
+      // If read fails, proceed without it
+    }
+  }
+
   const systemMsg = {
     role: "system",
     content:
-      "You are an expert coding assistant. Only perform concrete implementation tasks: write code, edit code, refactor, or generate exact output. Do not explain, plan, or add commentary. Provide ONLY the final content, without markdown fences.",
+      "You are an expert coding assistant. Perform concrete implementation tasks. Provide ONLY the final, complete file content – never return only a snippet or explanation. If you are modifying an existing file, you must output the whole file with the changes applied.",
   };
 
   let userContent = `Task: ${instruction}\nFile: ${normalizedPath}\n`;
   if (fileContext) {
-    userContent += `Relevant context:\n${fileContext}\n`;
+    userContent += `Additional context from user:\n${fileContext}\n`;
   }
-  userContent += `Output the entire file content (no markdown fences).`;
+  if (existingContent) {
+    userContent += `Current file content:\n'''\n${existingContent}\n'''\n`;
+  }
+  userContent += `Output the ENTIRE file content after applying the requested changes. Do not include markdown fences.`;
 
   const messages = [systemMsg, { role: "user", content: userContent }];
 
