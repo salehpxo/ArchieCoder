@@ -602,22 +602,43 @@ async function callApi(
     ...convertMessagesForProvider(messages),
   ];
 
-  const body = JSON.stringify({
+  const requestBody = {
     model: MODEL,
     max_tokens: 8192,
     messages: wireMessages,
     tools: makeToolDefinitions(),
-  });
+  };
 
-  const response = await fetch(API_URL, {
+  let response = await fetch(API_URL, {
     method: "POST",
     headers,
-    body,
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`API error ${response.status}: ${errorText}`);
+    if (errorText.includes("tool_choice") && errorText.includes("auto")) {
+      const fallbackResponse = await fetch(API_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 8192,
+          messages: wireMessages,
+        }),
+      });
+      response = fallbackResponse;
+      if (response.ok) {
+        console.log(
+          `${YELLOW}⏺ Provider rejected tool auto-choice; continuing without tools for this turn${RESET}`
+        );
+      } else {
+        const fallbackErrorText = await response.text();
+        throw new Error(`API error ${response.status}: ${fallbackErrorText}`);
+      }
+    } else {
+      throw new Error(`API error ${response.status}: ${errorText}`);
+    }
   }
 
   const raw: any = await response.json();
