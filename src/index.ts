@@ -447,7 +447,10 @@ async function toolBash(args: Record<string, JsonValue>): Promise<string> {
 // ---------------------------------------------------------------------------
 // Ollama Subagent Helpers
 // ---------------------------------------------------------------------------
-async function callOllamaChat(messages: Record<string, any>[], model: string): Promise<any> {
+async function callOllamaChatStream(
+  messages: Record<string, any>[],
+  model: string
+): Promise<string> {
   const baseUrl = OLLAMA_BASE_URL.replace(/\/+$/, "");
   const url = `${baseUrl}/api/chat`;
 
@@ -457,8 +460,8 @@ async function callOllamaChat(messages: Record<string, any>[], model: string): P
 
   const body = {
     model,
-    messages: messages,
-    stream: false,
+    messages,
+    stream: true,
   };
 
   const response = await fetch(url, {
@@ -472,9 +475,58 @@ async function callOllamaChat(messages: Record<string, any>[], model: string): P
     throw new Error(`Ollama chat error ${response.status}: ${errorText}`);
   }
 
-  const raw: any = await response.json();
-  console.log("🚀 ~ callOllamaChat ~ raw:", raw)
-  return raw.message;
+  if (!response.body) {
+    throw new Error("No response body for streaming");
+  }
+
+  let fullContent = "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";  // keep incomplete line
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.message?.content) {
+            const token = parsed.message.content;
+            fullContent += token;
+            process.stdout.write(token);
+          }
+        } catch {
+          // ignore parse errors for incomplete lines
+        }
+      }
+    }
+
+    // Process remaining buffer
+    if (buffer.trim()) {
+      try {
+        const parsed = JSON.parse(buffer.trim());
+        if (parsed.message?.content) {
+          fullContent += parsed.message.content;
+          process.stdout.write(parsed.message.content);
+        }
+      } catch {}
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Clean newline after stream
+  process.stdout.write("\n");
+  return fullContent;
 }
 
 async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> {
@@ -507,27 +559,15 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
   const messages = [systemMsg, { role: "user", content: userContent }];
 
   try {
-    const responseMsg = await callOllamaChat(messages, OLLAMA_MODEL);
-    // Extract text content (handling various response shapes)
-    let content = "";
-    if (typeof responseMsg === "string") {
-      content = responseMsg;
-    } else if (typeof responseMsg?.content === "string") {
-      content = responseMsg.content;
-    } else if (typeof responseMsg?.message?.content === "string") {
-      content = responseMsg.message.content;
-    } else {
-      content = JSON.stringify(responseMsg);
-    }
+    const content = await callOllamaChatStream(messages, OLLAMA_MODEL);
 
     const trimmed = content.trim();
     if (!trimmed) {
       return "error: ollama_code returned empty content";
     }
 
-    // Remove an outer code fence ONLY if the entire response is wrapped
+    // Remove outer code fence only if the entire response is wrapped
     let final = trimmed;
-    // Pattern: entire string is a single fenced block
     const wholeFenceRegex = /^```(?:\w*)\s*\n([\s\S]*)\n\s*```$/;
     const wholeMatch = final.match(wholeFenceRegex);
     if (wholeMatch) {
