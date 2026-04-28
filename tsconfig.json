@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+      // ECMAScript target & module system
+      "target": "ES2022",
+      "module": "NodeNext",
+      "moduleResolution": "NodeNext",
+  
+      // Output
+      "outDir": "dist",
+      "rootDir": "src",
+      "declaration": true,
+      "sourceMap": true,
+  
+      // Strictness & safety
+      "strict": true,
+      "noUncheckedIndexedAccess": true,
+      "exactOptionalPropertyTypes": false,   // sane default
+      "noFallthroughCasesInSwitch": true,
+      "forceConsistentCasingInFileNames": true,
+  
+      // Module interop (stay ESM-ready)
+      "esModuleInterop": true,
+      "resolveJsonModule": true,
+      "allowSyntheticDefaultImports": true,
+      "isolatedModules": true,
+  
+      // Build performance
+      "incremental": true,
+      "skipLibCheck": true
+    },
+    "include": ["src"],
+    "exclude": ["node_modules", "dist"]
+  }
