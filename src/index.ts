@@ -251,6 +251,102 @@ const IGNORED_FILE_EXTENSIONS = new Set([
   ".zip",
 ]);
 
+// ---------------------------------------------------------------------------
+// Memory tool
+// ---------------------------------------------------------------------------
+const MEMORY_DIR = process.env.MEMORY_DIR
+  ? path.resolve(process.env.MEMORY_DIR)
+  : path.join(CWD, ".memory");
+
+function slugifyKey(key: string): string {
+  return (
+    key
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "untitled"
+  );
+}
+
+async function ensureMemoryDir() {
+  await fs.mkdir(MEMORY_DIR, { recursive: true }).catch(() => { });
+}
+
+async function toolMemory(
+  args: Record<string, JsonValue>
+): Promise<string> {
+  const op = String(args.operation);
+  const rawKey = String(args.key ?? "");
+  const content = typeof args.content === "string" ? args.content : "";
+  const title = String(args.title ?? rawKey);
+  const tags = String(args.tags ?? "");
+  const query = String(args.query ?? "");
+
+  const key = slugifyKey(rawKey);
+  const filePath = path.join(MEMORY_DIR, `${key}.md`);
+
+  await ensureMemoryDir();
+
+  switch (op) {
+    case "save": {
+      if (!content) return "error: content is required for save";
+      const dateLine = `date: ${new Date().toISOString()}`;
+      const tagsLine = tags
+        ? `tags: ${tags
+          .split(",")
+          .map((t) => t.trim())
+          .join(", ")}`
+        : "";
+      const header = [`# ${title}`, dateLine, tagsLine]
+        .filter(Boolean)
+        .join("\n");
+      await fs.writeFile(filePath, `${header}\n\n${content}\n`, "utf-8");
+      return `ok: saved memory "${key}"`;
+    }
+    case "load": {
+      if (!existsSync(filePath)) return `error: memory "${key}" not found`;
+      return await fs.readFile(filePath, "utf-8");
+    }
+    case "delete": {
+      if (!existsSync(filePath)) return `error: memory "${key}" not found`;
+      await fs.unlink(filePath);
+      return `ok: deleted memory "${key}"`;
+    }
+    case "list": {
+      const files = await fs.readdir(MEMORY_DIR).catch(() => []);
+      const entries: string[] = [];
+      for (const f of files) {
+        if (!f.endsWith(".md")) continue;
+        const text = await fs
+          .readFile(path.join(MEMORY_DIR, f), "utf-8")
+          .catch(() => "");
+        const firstLine = text.split("\n")[0]?.replace(/^#\s*/, "") || f;
+        const tagMatch = text.match(/^tags:\s*(.+)$/m);
+        const tagStr = tagMatch ? ` [${tagMatch[1]}]` : "";
+        entries.push(`${f.replace(/\.md$/, "")}: ${firstLine}${tagStr}`);
+      }
+      return entries.length ? entries.join("\n") : "no memories yet";
+    }
+    case "search": {
+      if (!query) return "error: query is required for search";
+      const files = await fs.readdir(MEMORY_DIR).catch(() => []);
+      const results: string[] = [];
+      for (const f of files) {
+        if (!f.endsWith(".md")) continue;
+        const text = await fs
+          .readFile(path.join(MEMORY_DIR, f), "utf-8")
+          .catch(() => "");
+        if (text.toLowerCase().includes(query.toLowerCase())) {
+          results.push(`--- ${f} ---\n${text}\n`);
+        }
+      }
+      return results.length ? results.join("\n") : "none";
+    }
+    default:
+      return `error: unknown operation "${op}". Use save, load, delete, list, or search.`;
+  }
+}
+
 const MAX_READ_BYTES = 1024 * 1024;
 const DEFAULT_READ_LINES = 200;
 const MAX_READ_LINES = 500;
@@ -431,9 +527,8 @@ async function toolRead(args: Record<string, JsonValue>): Promise<string> {
     notes.push(`output capped at ${MAX_READ_OUTPUT_CHARS} chars`);
   }
 
-  const header = `file: ${normalizeToolPath(filePath)} (${stats.size} bytes), lines ${
-    offset + 1
-  }-${offset + lines.length}${notes.length ? `; ${notes.join("; ")}` : ""}`;
+  const header = `file: ${normalizeToolPath(filePath)} (${stats.size} bytes), lines ${offset + 1
+    }-${offset + lines.length}${notes.length ? `; ${notes.join("; ")}` : ""}`;
 
   return `${header}\n${lines.join("\n")}`;
 }
@@ -623,7 +718,7 @@ async function callOllamaChatStream(
           fullContent += parsed.message.content;
           process.stdout.write(parsed.message.content);
         }
-      } catch {}
+      } catch { }
     }
   } finally {
     reader.releaseLock();
@@ -675,24 +770,24 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
     role: "system",
     content: fileExists
       ? [
-          "You are an expert coding editor. You edit EXISTING files using SEARCH/REPLACE blocks.",
-          "Rules:",
-          "1. NEVER output the full file. Only output one or more SEARCH/REPLACE blocks.",
-          "2. Block format:",
-          "<<<<<<< SEARCH",
-          "exact text to find (must match the file exactly, including indentation)",
-          "=======",
-          "replacement text",
-          ">>>>>>> REPLACE",
-          "3. The SEARCH block must be an exact, unique substring of the current file.",
-          "4. If multiple changes are needed, use multiple SEARCH/REPLACE blocks.",
-          "5. DO NOT include any explanation, markdown fences, or extra commentary.",
-        ].join("\n")
+        "You are an expert coding editor. You edit EXISTING files using SEARCH/REPLACE blocks.",
+        "Rules:",
+        "1. NEVER output the full file. Only output one or more SEARCH/REPLACE blocks.",
+        "2. Block format:",
+        "<<<<<<< SEARCH",
+        "exact text to find (must match the file exactly, including indentation)",
+        "=======",
+        "replacement text",
+        ">>>>>>> REPLACE",
+        "3. The SEARCH block must be an exact, unique substring of the current file.",
+        "4. If multiple changes are needed, use multiple SEARCH/REPLACE blocks.",
+        "5. DO NOT include any explanation, markdown fences, or extra commentary.",
+      ].join("\n")
       : [
-          "You are an expert coding assistant. Create a NEW file from scratch.",
-          "Give ONLY the final, complete file content.",
-          "Do NOT include markdown fences, explanations, or extra text.",
-        ].join("\n"),
+        "You are an expert coding assistant. Create a NEW file from scratch.",
+        "Give ONLY the final, complete file content.",
+        "Do NOT include markdown fences, explanations, or extra text.",
+      ].join("\n"),
   };
 
   // ---- User message ----
@@ -812,8 +907,8 @@ async function toolOllamaBatch(args: Record<string, JsonValue>): Promise<string>
     const shortStatus = singleResult.startsWith("ok:")
       ? singleResult.split("to ").pop() ?? singleResult
       : singleResult.startsWith("error:")
-      ? `❌ ${singleResult.slice(7)}`
-      : singleResult;
+        ? `❌ ${singleResult.slice(7)}`
+        : singleResult;
     results.push(`[${i + 1}/${tasks.length}] ${shortStatus}`);
   }
 
@@ -967,6 +1062,42 @@ const TOOLS: Record<string, ToolEntry> = {
       required: ["tasks"],
     },
     fn: toolOllamaBatch,
+  },
+  memory: {
+    description:
+      "Persistent project memory. Save, load, delete, list, or search memory notes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: ["save", "load", "delete", "list", "search"],
+          description: "Memory operation to perform",
+        },
+        key: {
+          type: "string",
+          description: "Unique key for the memory (used as filename)",
+        },
+        content: {
+          type: "string",
+          description: "Memory content (Markdown) – required for save",
+        },
+        title: {
+          type: "string",
+          description: "Optional title; if omitted the key is used",
+        },
+        tags: {
+          type: "string",
+          description: "Comma-separated tags (optional)",
+        },
+        query: {
+          type: "string",
+          description: "Search query – required for search",
+        },
+      },
+      required: ["operation", "key"],
+    },
+    fn: toolMemory,
   },
 };
 
@@ -1746,6 +1877,14 @@ async function main() {
   IMPORTANT – performance rule:
    • Do NOT make parallel independent tool calls in the same turn (e.g., avoid calling read for 5 different files at once). Each turn should perform only one logical operation or a single investigation step. This avoids multiplying latency.
    • Use sequential tool calls only when the output of one is required for the next.
+
+    • Use the **memory** tool to remember important information **proactively** – without waiting for the user to ask.  
+    Save things like:  
+      - user preferences (indentation style, preferred libraries)  
+      - project decisions (architecture choices, confirmed approaches)  
+      - useful context that will help in future conversations.  
+    Use operation: "save".  
+    Avoid saving trivial or transient information.
   
   After any tool response, reply concisely and wait for the user’s next instruction.`;
 
