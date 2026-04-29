@@ -15,10 +15,16 @@
  */
 
 import * as fs from "node:fs/promises";
-import { existsSync, statSync, readFileSync, type Dirent } from "node:fs";
+import {
+  createReadStream,
+  existsSync,
+  readFileSync,
+  statSync,
+  type Dirent,
+} from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { emitKeypressEvents } from "node:readline";
+import { createInterface, emitKeypressEvents } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 
 // ---------------------------------------------------------------------------
@@ -95,6 +101,14 @@ interface JsonObject {
 }
 type JsonArray = JsonValue[];
 
+interface ToolJsonSchema {
+  type: string;
+  description?: string;
+  properties?: Record<string, ToolJsonSchema>;
+  items?: ToolJsonSchema;
+  required?: string[];
+}
+
 interface ToolDefinition {
   type: "function";
   function: {
@@ -102,7 +116,7 @@ interface ToolDefinition {
     description: string;
     parameters: {
       type: "object";
-      properties: Record<string, { type: string; description?: string }>;
+      properties: Record<string, ToolJsonSchema>;
       required: string[];
     };
   };
@@ -238,6 +252,10 @@ const IGNORED_FILE_EXTENSIONS = new Set([
 ]);
 
 const MAX_READ_BYTES = 1024 * 1024;
+const DEFAULT_READ_LINES = 200;
+const MAX_READ_LINES = 500;
+const MAX_READ_OUTPUT_CHARS = 80_000;
+const MAX_READ_LINE_CHARS = 2_000;
 
 function normalizeToolPath(filePath: string): string {
   return path
@@ -314,24 +332,110 @@ async function glob(
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
+function parseNonNegativeInteger(
+  value: JsonValue | undefined,
+  fallback: number
+): number | undefined {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    return undefined;
+  }
+  return value;
+}
+
 async function toolRead(args: Record<string, JsonValue>): Promise<string> {
-  const filePath = args.path as string;
+  const filePath = args.path;
+  if (typeof filePath !== "string" || !filePath.trim()) {
+    return "error: path must be a non-empty string";
+  }
+
   const ignoredReason = ignoredPathReason(filePath);
   if (ignoredReason) {
     return `error: refused to read ${filePath} (${ignoredReason})`;
   }
-  const stats = await fs.stat(filePath);
-  if (stats.size > MAX_READ_BYTES) {
-    return `error: refused to read ${filePath} (file is larger than ${MAX_READ_BYTES} bytes)`;
+
+  const offset = parseNonNegativeInteger(args.offset, 0);
+  if (offset === undefined) {
+    return "error: offset must be a non-negative integer";
   }
-  const offset = (args.offset as number) ?? 0;
-  const limit = args.limit as number | undefined;
-  const content = await fs.readFile(filePath, "utf-8");
-  const lines = content.split("\n");
-  const selected = lines.slice(offset, limit ? offset + limit : undefined);
-  return selected
-    .map((line, idx) => String(offset + idx + 1).padStart(4) + "| " + line)
-    .join("\n");
+
+  const requestedLimit = parseNonNegativeInteger(args.limit, DEFAULT_READ_LINES);
+  if (requestedLimit === undefined || requestedLimit === 0) {
+    return "error: limit must be a positive integer";
+  }
+  const limit = Math.min(requestedLimit, MAX_READ_LINES);
+
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile()) {
+    return `error: refused to read ${filePath} (not a file)`;
+  }
+
+  const stream = createReadStream(filePath, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+  const lines: string[] = [];
+  let currentLine = 0;
+  let outputChars = 0;
+  let hitOutputLimit = false;
+  let hitLineLimit = false;
+  let hasMoreLines = false;
+
+  try {
+    for await (const rawLine of rl) {
+      if (currentLine < offset) {
+        currentLine++;
+        continue;
+      }
+
+      if (lines.length >= limit) {
+        hasMoreLines = true;
+        break;
+      }
+
+      let line = rawLine;
+      if (line.length > MAX_READ_LINE_CHARS) {
+        line = `${line.slice(0, MAX_READ_LINE_CHARS)}... [line truncated]`;
+        hitLineLimit = true;
+      }
+
+      const numberedLine = `${String(currentLine + 1).padStart(4)}| ${line}`;
+      if (outputChars + numberedLine.length > MAX_READ_OUTPUT_CHARS) {
+        hitOutputLimit = true;
+        hasMoreLines = true;
+        break;
+      }
+
+      lines.push(numberedLine);
+      outputChars += numberedLine.length + 1;
+      currentLine++;
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+
+  if (!lines.length) {
+    return `empty: no lines at or after offset ${offset}`;
+  }
+
+  const notes: string[] = [];
+  if (requestedLimit > MAX_READ_LINES) {
+    notes.push(`limit capped at ${MAX_READ_LINES} lines`);
+  }
+  if (hasMoreLines) {
+    notes.push(`more available; continue with offset ${offset + lines.length}`);
+  }
+  if (hitLineLimit) {
+    notes.push(`long lines capped at ${MAX_READ_LINE_CHARS} chars`);
+  }
+  if (hitOutputLimit) {
+    notes.push(`output capped at ${MAX_READ_OUTPUT_CHARS} chars`);
+  }
+
+  const header = `file: ${normalizeToolPath(filePath)} (${stats.size} bytes), lines ${
+    offset + 1
+  }-${offset + lines.length}${notes.length ? `; ${notes.join("; ")}` : ""}`;
+
+  return `${header}\n${lines.join("\n")}`;
 }
 
 async function toolWrite(args: Record<string, JsonValue>): Promise<string> {
@@ -729,16 +833,20 @@ interface ToolEntry {
 
 const TOOLS: Record<string, ToolEntry> = {
   read: {
-    description: "Read file with line numbers (file path, not directory)",
+    description:
+      "Read a bounded window of a file with line numbers. Defaults to 200 lines and caps output to avoid wasting context; use offset/limit to page through large files.",
     inputSchema: {
       type: "object",
       properties: {
         path: { type: "string" },
         offset: {
           type: "integer",
-          description: "optional starting line (0-indexed)",
+          description: "optional starting line (0-indexed, default 0)",
         },
-        limit: { type: "integer", description: "optional max lines" },
+        limit: {
+          type: "integer",
+          description: `optional max lines (default ${DEFAULT_READ_LINES}, cap ${MAX_READ_LINES})`,
+        },
       },
       required: ["path"],
     },
