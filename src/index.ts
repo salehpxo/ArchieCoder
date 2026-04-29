@@ -451,11 +451,12 @@ async function callOllamaChatStream(
   messages: Record<string, any>[],
   model: string
 ): Promise<string> {
-  const baseUrl = OLLAMA_BASE_URL.replace(/\/+$/, "");
-  const url = `${baseUrl}/api/chat`;
+  const baseUrl = API_URL.replace(/\/+$/, "");
+  const url = `${baseUrl}`;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    Authorization: `Bearer ${API_KEY}`,
   };
 
   const body = {
@@ -530,6 +531,9 @@ async function callOllamaChatStream(
 }
 
 // -------------------- new toolOllamaCode --------------------
+// ---------------------------------------------------------------------------
+// Updated toolOllamaCode – SEARCH/REPLACE for existing files, full content for new
+// ---------------------------------------------------------------------------
 async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> {
   const instruction = args.instruction as string;
   const fileContext = (args.file_context as string) ?? "";
@@ -662,18 +666,9 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
   }
 }
 
-/**
- * Parse SEARCH/REPLACE blocks from a string.
- * Expected format:
- * <<<<<<< SEARCH
- * ... search text ...
- * =======
- * ... replace text ...
- * >>>>>>> REPLACE
- *
- * Multiple blocks are allowed; the markers must appear on their own lines.
- * Trailing whitespace on marker lines is allowed.
- */
+// ---------------------------------------------------------------------------
+// Parse SEARCH/REPLACE blocks from raw subagent output
+// ---------------------------------------------------------------------------
 function parseSearchReplaceBlocks(text: string): { search: string; replace: string }[] {
   const blocks: { search: string; replace: string }[] = [];
   const regex = /<<<<<<< SEARCH\s*\n([\s\S]*?)\n?=======\s*\n([\s\S]*?)\n?>>>>>>> REPLACE/g;
@@ -682,6 +677,7 @@ function parseSearchReplaceBlocks(text: string): { search: string; replace: stri
   while ((match = regex.exec(text)) !== null) {
     const search = match[1] ?? "";
     const replace = match[2] ?? "";
+    // Trim trailing newline added by the regex's non‑greedy capture
     blocks.push({ search, replace });
   }
 
@@ -1634,9 +1630,14 @@ async function main() {
    • For a single file, use **ollama_code** with a concrete **file_path**.
    • For multiple files, use **ollama_batch** with a **tasks** array. Each task requires instruction and file_path.
    • These tools write files directly – you do NOT need to call write/edit afterwards.
+   • After the tool returns "ok: …", assume the change succeeded. DO NOT immediately re‑read the file to verify. Only re‑read if you need further information for a genuinely new task.
    • After the tool succeeds, reply with a brief summary of what was created/updated.
   
   When you need to investigate, use read/glob/grep/bash freely.
+  
+  IMPORTANT – performance rule:
+   • Do NOT make parallel independent tool calls in the same turn (e.g., avoid calling read for 5 different files at once). Each turn should perform only one logical operation or a single investigation step. This avoids multiplying latency.
+   • Use sequential tool calls only when the output of one is required for the next.
   
   After any tool response, reply concisely and wait for the user’s next instruction.`;
 
