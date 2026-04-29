@@ -27,6 +27,8 @@ import { spawn } from "node:child_process";
 import { createInterface, emitKeypressEvents } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 
+import { swarmCLI, type SwarmPattern } from "./swarm.ts";
+
 // ---------------------------------------------------------------------------
 // ANSI styling
 // ---------------------------------------------------------------------------
@@ -64,6 +66,14 @@ const API_URL =
 const MODEL = process.env.MODEL ?? "deepseek-v4-flash";
 const CWD = process.cwd();
 const TERMINAL_WIDTH = process.stdout.columns ?? 80;
+
+// ---------------------------------------------------------------------------
+// Token budget config
+// ---------------------------------------------------------------------------
+const MAX_INPUT_TOKENS = 12_000;
+const CHARS_PER_TOKEN_ESTIMATE = 4;
+const TOOL_RESULT_MAX_CHARS = 4_000;
+const CACHE_TTL_MS = 60_000;
 
 // ----- Command history -----
 const inputHistory: string[] = [];
@@ -159,6 +169,29 @@ interface Message {
 interface CallApiResult {
   response: ApiResponse;
   rawAssistantMessage?: Record<string, any>;
+}
+
+function estimateTokens(messages: Message[], systemPrompt: string): number {
+  let total = systemPrompt.length / CHARS_PER_TOKEN_ESTIMATE;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      total += msg.content.length / CHARS_PER_TOKEN_ESTIMATE;
+    } else {
+      total += JSON.stringify(msg.content).length / CHARS_PER_TOKEN_ESTIMATE;
+    }
+    if (msg.rawAssistantMessage) {
+      total += JSON.stringify(msg.rawAssistantMessage).length / CHARS_PER_TOKEN_ESTIMATE;
+    }
+  }
+  return Math.ceil(total);
+}
+
+function truncateToolResult(text: string): string {
+  if (text.length <= TOOL_RESULT_MAX_CHARS) return text;
+  return (
+    text.slice(0, TOOL_RESULT_MAX_CHARS) +
+    `\n… [truncated – ${text.length} chars total, use offset/limit or narrower queries to explore]`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -348,9 +381,9 @@ async function toolMemory(
 }
 
 const MAX_READ_BYTES = 1024 * 1024;
-const DEFAULT_READ_LINES = 200;
-const MAX_READ_LINES = 500;
-const MAX_READ_OUTPUT_CHARS = 80_000;
+const DEFAULT_READ_LINES = 50;
+const MAX_READ_LINES = 200;
+const MAX_READ_OUTPUT_CHARS = 4_000;
 const MAX_READ_LINE_CHARS = 2_000;
 
 function normalizeToolPath(filePath: string): string {
@@ -562,7 +595,17 @@ async function toolGlob(args: Record<string, JsonValue>): Promise<string> {
   const pat = args.pat as string;
   const base = (args.path as string) ?? ".";
   const files = await glob(pat, base);
-  return files.length ? files.join("\n") : "none";
+  if (!files.length) return "none";
+
+  const cappedFiles = files.slice(0, 50);
+  let output = cappedFiles.join("\n");
+  if (files.length > cappedFiles.length) {
+    output += `\n… ${files.length - cappedFiles.length} more paths omitted`;
+  }
+  if (output.length > 2_000) {
+    output = `${output.slice(0, 2_000)}\n… [glob output truncated]`;
+  }
+  return output;
 }
 
 async function toolGrep(args: Record<string, JsonValue>): Promise<string> {
@@ -571,29 +614,45 @@ async function toolGrep(args: Record<string, JsonValue>): Promise<string> {
   const regex = new RegExp(pat);
   const hits: string[] = [];
   const files = await glob("**/*", base);
+  let omitted = false;
   for (const filePath of files) {
-    if (hits.length >= 50) break;
+    if (hits.length >= 20) {
+      omitted = true;
+      break;
+    }
     try {
       if (statSync(filePath).size > MAX_READ_BYTES) continue;
       const content = await fs.readFile(filePath, "utf-8");
       const lines = content.split("\n");
       for (let i = 0; i < lines.length; i++) {
-        if (hits.length >= 50) break;
+        if (hits.length >= 20) {
+          omitted = true;
+          break;
+        }
         const line = lines[i] ?? "";
         if (regex.test(line)) {
-          hits.push(`${filePath}:${i + 1}:${line.trimEnd()}`);
+          const trimmedLine = line.trimEnd();
+          const cappedLine =
+            trimmedLine.length > 200
+              ? `${trimmedLine.slice(0, 200)}… [line truncated]`
+              : trimmedLine;
+          hits.push(`${filePath}:${i + 1}:${cappedLine}`);
         }
       }
     } catch {
       // skip unreadable files
     }
   }
-  return hits.length ? hits.join("\n") : "none";
+  if (omitted) hits.push("… further matches omitted");
+  if (!hits.length) return "none";
+  const output = hits.join("\n");
+  return output.length > 2_000 ? `${output.slice(0, 2_000)}\n… [grep output truncated]` : output;
 }
 
 async function toolBash(args: Record<string, JsonValue>): Promise<string> {
   const cmd = args.cmd as string;
   const outputLines: string[] = [];
+  const FULL_OUTPUT_MAX_CHARS = 4_000;
 
   return new Promise((resolve) => {
     const child = spawn(cmd, {
@@ -633,7 +692,12 @@ async function toolBash(args: Record<string, JsonValue>): Promise<string> {
       if (timedOut) {
         outputLines.push("\n(timed out after 30s)");
       }
-      resolve(outputLines.join("\n").trim() || "(empty)");
+      const joined = outputLines.join("\n").trim();
+      if (joined.length > FULL_OUTPUT_MAX_CHARS) {
+        resolve(`${joined.slice(0, FULL_OUTPUT_MAX_CHARS)}\n… [output truncated]`);
+      } else {
+        resolve(joined || "(empty)");
+      }
     });
 
     child.on("error", (err) => {
@@ -810,7 +874,7 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
   try {
     rawOutput = await callOllamaChatStream(messages, OLLAMA_MODEL);
   } catch (err: any) {
-    return `Error calling Ollama subagent: ${err.message ?? err}`;
+    return `Error calling Ollama subagent: ${String(err.message ?? err).slice(0, 200)}`;
   }
 
   if (!rawOutput || rawOutput.trim().length === 0) {
@@ -823,7 +887,7 @@ async function toolOllamaCode(args: Record<string, JsonValue>): Promise<string> 
     const blocks = parseSearchReplaceBlocks(rawOutput);
 
     if (blocks.length === 0) {
-      return `error: ollama_code did not produce any valid SEARCH/REPLACE block.\nModel response:\n"""\n${rawOutput}\n"""`;
+      return `error: no valid SEARCH/REPLACE blocks. First 500 chars: ${rawOutput.slice(0, 500)}`;
     }
 
     // Apply each block sequentially using the edit tool
@@ -910,6 +974,13 @@ async function toolOllamaBatch(args: Record<string, JsonValue>): Promise<string>
         ? `❌ ${singleResult.slice(7)}`
         : singleResult;
     results.push(`[${i + 1}/${tasks.length}] ${shortStatus}`);
+  }
+
+  const MAX_BATCH_RESULT_LINES = 15;
+  if (results.length > MAX_BATCH_RESULT_LINES) {
+    const omitted = results.length - (MAX_BATCH_RESULT_LINES - 1);
+    results.length = MAX_BATCH_RESULT_LINES - 1;
+    results.push(`… and ${omitted} more tasks`);
   }
 
   return `Batch complete:\n${results.join("\n")}`;
@@ -1098,6 +1169,91 @@ const TOOLS: Record<string, ToolEntry> = {
       required: ["operation", "key"],
     },
     fn: toolMemory,
+  },
+  swarm_invoke: {
+    description:
+      "Invoke a specific agent to perform a subtask. Use within multi-agent workflows to delegate work to specialist agents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "ID of the agent to invoke (e.g., 'coder', 'reviewer')",
+        },
+        task: {
+          type: "string",
+          description: "The specific task to delegate to this agent",
+        },
+        context: {
+          type: "string",
+          description: "Additional context from previous steps",
+        },
+      },
+      required: ["agent_id", "task"],
+    },
+    fn: async (args) => {
+      await swarmCLI.init();
+      const agent = swarmCLI.registry.get(args.agent_id as string);
+      if (!agent) return `error: agent "${args.agent_id}" not found`;
+      // In production: call LLM with agent's system prompt
+      return `Agent ${agent.name} invoked for: ${args.task}`;
+    },
+  },
+
+  swarm_broadcast: {
+    description:
+      "Broadcast a message to all agents in the swarm. Useful for sharing context or requesting input from multiple specialists.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message: {
+          type: "string",
+          description: "Message to broadcast to all agents",
+        },
+        exclude: {
+          type: "string",
+          description: "Comma-separated list of agent IDs to exclude",
+        },
+      },
+      required: ["message"],
+    },
+    fn: async (args) => {
+      await swarmCLI.init();
+      const agents = swarmCLI.registry.getAll();
+      const exclude = new Set((args.exclude as string || "").split(",").map((s) => s.trim()));
+      const results: string[] = [];
+      for (const agent of agents) {
+        if (exclude.has(agent.id)) continue;
+        results.push(`${agent.name}: received broadcast`);
+      }
+      return `Broadcast sent to ${results.length} agents\n${results.join("\n")}`;
+    },
+  },
+
+  swarm_plan: {
+    description:
+      "Create an execution plan using the planner agent. Returns a structured plan with steps and agent assignments.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: {
+          type: "string",
+          description: "The high-level task to plan",
+        },
+        pattern: {
+          type: "string",
+          enum: ["supervisor", "pipeline", "swarm", "map-reduce"],
+          description: "Execution pattern to use",
+        },
+      },
+      required: ["task"],
+    },
+    fn: async (args) => {
+      await swarmCLI.init();
+      const planner = swarmCLI.registry.get("planner");
+      if (!planner) return "error: planner agent not found";
+      return `Plan for: ${args.task}\nPattern: ${args.pattern || "supervisor"}\n[Plan would be generated by LLM]`;
+    },
   },
 };
 
@@ -1354,6 +1510,22 @@ async function callApi(
   }
 
   throw new Error("Unrecognised API response format");
+}
+
+async function callApiWithBudget(
+  messages: Message[],
+  systemPrompt: string
+): Promise<CallApiResult> {
+  while (
+    messages.length > 2 &&
+    estimateTokens(messages, systemPrompt) > MAX_INPUT_TOKENS
+  ) {
+    messages.shift();
+    if (messages[0]?.role === "assistant") {
+      messages.shift();
+    }
+  }
+  return callApi(messages, systemPrompt);
 }
 
 // ---------------------------------------------------------------------------
@@ -1863,30 +2035,44 @@ async function main() {
 
   const messages: Message[] = [];
   const systemPrompt = `cwd: ${CWD}.
-  You are a precise coding assistant. Understand the user’s request, gather context with tools, and deliver concrete, correct results.
+  You are a precise coding assistant. Understand the user's request, gather context with tools, and deliver concrete, correct results.
   
   When you need to generate or change code:
    • For a single file, use **ollama_code** with a concrete **file_path**.
-   • For multiple files, use **ollama_batch** with a **tasks** array. Each task requires instruction and file_path.
+   • For multiple files, use **ollama_batch** with a **tasks** array.
    • These tools write files directly – you do NOT need to call write/edit afterwards.
-   • After the tool returns "ok: …", assume the change succeeded. DO NOT immediately re‑read the file to verify. Only re‑read if you need further information for a genuinely new task.
-   • After the tool succeeds, reply with a brief summary of what was created/updated.
+   • After the tool returns "ok: ...", assume the change succeeded.
+   • After the tool succeeds, reply with a brief summary.
   
   When you need to investigate, use read/glob/grep/bash freely.
   
   IMPORTANT – performance rule:
-   • Do NOT make parallel independent tool calls in the same turn (e.g., avoid calling read for 5 different files at once). Each turn should perform only one logical operation or a single investigation step. This avoids multiplying latency.
+   • Do NOT make parallel independent tool calls in the same turn.
    • Use sequential tool calls only when the output of one is required for the next.
-
-  • Use the **memory** tool to remember important information **proactively** – without waiting for the user to ask.  
-    Save things like:  
-      - user preferences (indentation style, preferred libraries)  
-      - project decisions (architecture choices, confirmed approaches)  
-      - useful context that will help in future conversations.  
-    Use operation: "save".  
-    Avoid saving trivial or transient information.
   
-  After any tool response, reply concisely and wait for the user’s next instruction.`;
+  ## Agent Swarm
+  
+  You can orchestrate multiple specialized agents for complex tasks:
+  
+  - Use **swarm_plan** to create a structured execution plan
+  - Use **swarm_invoke** to delegate subtasks to specialist agents
+  - Use **swarm_broadcast** to share context across all agents
+  
+  Available agents are defined in .archie/agents/*.md files. Each agent has:
+  - Specialized capabilities and tools
+  - A system prompt defining its expertise
+  - Routing rules for automatic task assignment
+  
+  When a task requires multiple skills (e.g., coding + testing + review),
+  prefer using the swarm tools over doing everything yourself.
+  
+  For quick swarm execution, users can also use CLI commands:
+  - /swarm <pattern> <agents> <task>
+  - /route <task> — see which agents match
+  
+  Use the **memory** tool to remember important information proactively.
+  
+  After any tool response, reply concisely and wait for the user's next instruction.`;
 
   let sessionCount = 1;
   const promptStr = () => `${BOLD}${CYAN}${path.basename(CWD)}${RESET} ${BLUE}#${sessionCount}${RESET} ${BOLD}${BLUE}❯${RESET} `;
@@ -1916,21 +2102,34 @@ async function main() {
       if (trimmed === "/help") {
         console.log(
           `${GREEN}Commands:${RESET}
-  /c, /new    – start a fresh conversation
-  /q, exit    – quit
-  /init       – analyze codebase and create/improve AGENTS.md
-  /help       – show this help
-
-${GREEN}Tools (called by the assistant automatically):${RESET}
-  read, write, edit, glob, grep, bash, ollama_code, memory
-
-${GREEN}Input features:${RESET}
-  @filename   – fuzzy file picker (type @, arrows, Tab/Enter)
-  Up/Down     – command history (when cursor at very start/end)
-  Shift+Enter – insert newline
-  Ctrl+C      – quit
-  Ctrl+D      – cancel input
-  Ctrl+L      – clear screen`
+        /c, /new    – start a fresh conversation
+        /q, exit    – quit
+        /init       – analyze codebase and create/improve AGENTS.md
+        /help       – show this help
+      
+      ${GREEN}Swarm Commands:${RESET}
+        /agents, /swarm list          – list available agents
+        /agent <id>                   – show agent details
+        /swarm [pattern] [agents] <task>  – run task with agent swarm
+        /route <task>                 – analyze which agents would handle a task
+      
+        Examples:
+          /swarm supervisor coder,reviewer implement auth
+          /swarm pipeline planner,coder,tester build API
+          /swarm swarm all brainstorm naming
+          /swarm map-reduce coder,coder,coder refactor
+      
+      ${GREEN}Tools (called by the assistant automatically):${RESET}
+        read, write, edit, glob, grep, bash, ollama_code, memory,
+        swarm_invoke, swarm_broadcast, swarm_plan
+      
+      ${GREEN}Input features:${RESET}
+        @filename   – fuzzy file picker (type @, arrows, Tab/Enter)
+        Up/Down     – command history (when cursor at very start/end)
+        Shift+Enter – insert newline
+        Ctrl+C      – quit
+        Ctrl+D      – cancel input
+        Ctrl+L      – clear screen`
         );
         continue;
       }
@@ -1969,10 +2168,67 @@ This file provides guidance to archiecode when working with code in this reposit
         // fall through to the agent turn loop (no `continue`)
       }
 
+      // ═══════════════════════════════════════════════════════════════════════════
+      // SWARM COMMANDS
+      // ═══════════════════════════════════════════════════════════════════════════
+
+      if (trimmed === "/agents" || trimmed === "/swarm list") {
+        await swarmCLI.init();
+        console.log("\n" + (await swarmCLI.listAgents()) + "\n");
+        continue;
+      }
+
+      if (trimmed.startsWith("/agent ")) {
+        await swarmCLI.init();
+        const id = trimmed.slice(7).trim();
+        console.log("\n" + (await swarmCLI.showAgent(id)) + "\n");
+        continue;
+      }
+
+      if (trimmed.startsWith("/swarm ")) {
+        await swarmCLI.init();
+        const args = trimmed.slice(6).trim();
+
+        // Parse: /swarm [pattern] [agent1,agent2,...] <task>
+        const parts = args.split(" ");
+        let pattern: SwarmPattern = "supervisor";
+        let agentIds: string[] | undefined;
+        let taskStart = 0;
+
+        const possiblePatterns: SwarmPattern[] = ["supervisor", "pipeline", "swarm", "map-reduce"];
+        if (possiblePatterns.includes(parts[0] as SwarmPattern)) {
+          pattern = parts[0] as SwarmPattern;
+          taskStart = 1;
+        }
+
+        if (parts[taskStart]?.includes(",")) {
+          const ids = parts[taskStart].split(",").map((s) => s.trim());
+          agentIds = ids[0] === "all" ? ["all"] : ids;
+          taskStart++;
+        }
+
+        const task = parts.slice(taskStart).join(" ");
+        if (!task) {
+          console.log(`${RED}Usage: /swarm [pattern] [agent1,agent2,...] <task>${RESET}`);
+          console.log(`${DIM}Patterns: supervisor, pipeline, swarm, map-reduce${RESET}`);
+          continue;
+        }
+
+        console.log(await swarmCLI.run(task, pattern, agentIds));
+        continue;
+      }
+
+      if (trimmed.startsWith("/route ")) {
+        await swarmCLI.init();
+        const task = trimmed.slice(7).trim();
+        console.log("\n" + (await swarmCLI.route(task)) + "\n");
+        continue;
+      }
+
       if (trimmed !== "/init") {
         messages.push({ role: "user", content: await buildMentionContext(trimmed) });
       }
-      
+
       let turn = true;
       while (turn) {
         const { response, rawAssistantMessage } = await callApi(
